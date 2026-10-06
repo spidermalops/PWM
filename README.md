@@ -1,5 +1,7 @@
 # Pentest Workflow Manager (PWM)
 
+![PWM Dashboard](assets/dashboard.png)
+
 ## Features
 
 - 7-stage automated "kill chain" workflow: Reconnaissance, Vulnerability Analysis, Deep & Zero-Day Analysis, API Vulnerability Scan, Database Vulnerability Scan, Exploitation Prep, and Post-Exploitation Review
@@ -73,7 +75,3 @@ python3 app.py
 ```bash
 python app.py
 ```
-
-## Screenshot
-
-![PWM Dashboard](assets/dashboard.png)
