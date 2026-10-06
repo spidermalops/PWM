@@ -53,7 +53,7 @@ CHAIN = [
             {
                 "id": "recon_ports", "label": "Port & Service Scan", "tool": "nmap / masscan",
                 "description": "Full TCP port scan (all 65535 ports at fast rate) then light version detection on open ports only. Uses SYN scan when run with privileges, TCP connect scan otherwise.",
-                "cmd_template": "nmap -p- --min-rate 10000 -T5 --open -oG {outdir}/nmap_full.gnmap {target} 2>&1; echo '---SERVICE SCAN---'; PORTS=$(grep -oE '[0-9]+/open/tcp' {outdir}/nmap_full.gnmap 2>/dev/null | cut -d/ -f1 | tr '\n' ',' | sed 's/,$//'); if [ -n \"$PORTS\" ]; then nmap -sV --version-light --max-retries 1 -p \"$PORTS\" -T4 {target} 2>&1; else echo 'No open TCP ports found'; fi",
+                "cmd_template": "nmap -p- --min-rate 1000 --max-rate 3000 -T4 --open -oG {outdir}/nmap_full.gnmap {target} 2>&1; echo '---SERVICE SCAN---'; PORTS=$(grep -oE '[0-9]+/open/tcp' {outdir}/nmap_full.gnmap 2>/dev/null | cut -d/ -f1 | sort -un | tr '\n' ',' | sed 's/,$//'); if [ -n \"$PORTS\" ]; then nmap -sV --version-light --max-retries 1 -p \"$PORTS\" -T4 {target} 2>&1; else echo 'No open TCP ports found'; fi",
                 "fallback_cmd": "nmap -sV --version-light --open -p 21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5432,5900,6379,8080,8443,9200,27017 -T4 -oN {outdir}/nmap_common.txt {target} 2>&1",
                 "parse": "nmap",
             },
@@ -61,7 +61,7 @@ CHAIN = [
                 "id": "recon_udp", "label": "UDP Top-20 Probe", "tool": "nmap -sU",
                 "description": "UDP scan for SNMP, DNS, TFTP, NTP, LDAP and other UDP services.",
                 "cmd_template": "timeout -k 5 90 nmap -sU --open -p 53,67,68,69,123,137,138,161,162,389,500,514,623,1194,5353 -T4 -oN {outdir}/nmap_udp.txt {target} 2>&1",
-                "fallback_cmd": "python3 -c \"import socket\nsvc={53:'domain',67:'dhcp',68:'dhcp',69:'tftp',123:'ntp',137:'netbios-ns',138:'netbios-dgm',161:'snmp',162:'snmptrap',389:'ldap',500:'isakmp',514:'syslog',623:'ipmi',1194:'openvpn',5353:'mdns'}\nfor p in [53,67,68,69,123,137,138,161,162,389,500,514,623,1194,5353]:\n s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n s.settimeout(1)\n try:\n  s.sendto(b'',('{target}',p))\n  s.recv(1)\n  print(str(p)+'/udp open '+svc.get(p,'unknown'))\n except socket.timeout:\n  print(str(p)+'/udp open|filtered')\n except ConnectionRefusedError:\n  print(str(p)+'/udp closed')\n except OSError:\n  print(str(p)+'/udp error')\n finally:\n  s.close()\"",
+                "fallback_cmd": "python3 -c \"import socket\nsvc={53:'domain',67:'dhcp',68:'dhcp',69:'tftp',123:'ntp',137:'netbios-ns',138:'netbios-dgm',161:'snmp',162:'snmptrap',389:'ldap',500:'isakmp',514:'syslog',623:'ipmi',1194:'openvpn',5353:'mdns'}\nfor p in [53,67,68,69,123,137,138,161,162,389,500,514,623,1194,5353]:\n s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n s.settimeout(1)\n try:\n  s.connect(('{target}',p)); s.send(b''); s.recv(1)\n  print(str(p)+'/udp open '+svc.get(p,'unknown'))\n except socket.timeout:\n  print(str(p)+'/udp open|filtered')\n except ConnectionRefusedError:\n  print(str(p)+'/udp closed')\n except OSError:\n  print(str(p)+'/udp error')\n finally:\n  s.close()\"",
                 "parse": "nmap", "requires_root": True,
             },
             {
@@ -74,7 +74,7 @@ CHAIN = [
             {
                 "id": "recon_web", "label": "HTTP/S Fingerprint", "tool": "curl / whatweb",
                 "description": "Banner grab, redirect chain, server headers, X-Powered-By, CSP, CORS, cookie flags, WAF detection, technology stack.",
-                "cmd_template": "curl -sIL --max-time 8 http://{target} 2>&1; echo '=HTTPS='; curl -skIL --max-time 8 https://{target} 2>&1; curl -skI --max-time 8 http://{target}:8080 2>&1; curl -skI --max-time 8 https://{target}:8443 2>&1; echo '=WHATWEB='; timeout -k 5 60 whatweb -a 1 http://{target} 2>&1 | head -20; echo '=WAF='; timeout -k 5 45 wafw00f http://{target} 2>&1 | head -15",
+                "cmd_template": "curl -sIL --max-time 8 http://{target} 2>&1; echo '=HTTPS='; curl -skIL --max-time 8 https://{target} 2>&1; curl -skI --max-time 8 http://{target}:8080 2>&1; curl -skI --max-time 8 https://{target}:8443 2>&1; echo '=DISCOVERED PORTS='; for p in $(echo \"{ports}\" | tr ',' '\\n' | grep -vE '^(80|443|8080|8443)$' | head -8); do [ -z \"$p\" ] && continue; echo \"--- HTTP on :$p ---\"; curl -skI --max-time 3 \"http://{target}:$p\" 2>&1 | head -8; done; echo '=WHATWEB='; timeout -k 5 60 whatweb -a 1 http://{target} 2>&1 | head -20; echo '=WAF='; timeout -k 5 45 wafw00f http://{target} 2>&1 | head -15",
                 "fallback_cmd": "curl -sIL --max-time 8 http://{target} 2>&1; curl -skIL --max-time 8 https://{target} 2>&1",
                 "parse": "headers",
             },
@@ -666,14 +666,23 @@ def run_command(sid, sub_id, cmd, timeout=PWM_CMD_TIMEOUT):
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_nmap(output):
     findings = []
+    best = {}
     for line in output.splitlines():
         m = re.match(r'(\d+)/(tcp|udp)\s+(open\S*)\s+(\S+)\s*(.*)', line)
         if m:
             svc, ver = m.group(4), m.group(5).strip()
-            findings.append({"type":"open_port","port":m.group(1),"proto":m.group(2),
-                              "service":svc,"version":ver,"severity":"info",
-                              "detail":f"{m.group(1)}/{m.group(2)} {svc} {ver}",
-                              "path":f":{m.group(1)}"})
+            key = (m.group(1), m.group(2))
+            f = {"type":"open_port","port":m.group(1),"proto":m.group(2),
+                 "service":svc,"version":ver,"severity":"info",
+                 "detail":f"{m.group(1)}/{m.group(2)} {svc} {ver}",
+                 "path":f":{m.group(1)}"}
+            prev = best.get(key)
+            if prev is None:
+                best[key] = f
+                findings.append(f)
+            elif ver or not prev['version']:
+                # a later table (e.g. -sV run after the full-port sweep) wins
+                prev.update(f)
     if 'OS details:' in output or 'OS CPE:' in output:
         for line in output.splitlines():
             if 'OS details:' in line or 'Running:' in line:
@@ -1615,6 +1624,23 @@ LONG_SUBSTAGE_TIMEOUT = {
 }
 
 def execute_substage(sid, sub_id):
+    """Safety net: a substage must ALWAYS reach 'completed' (or the chain stalls forever)."""
+    try:
+        _execute_substage(sid, sub_id)
+    except Exception as e:
+        print(f"[execute_substage] {sub_id} crashed: {e!r}", flush=True)
+        sess = sessions.get(sid)
+        if not sess:
+            return
+        push(sid, "output", {"substage": sub_id, "line": f"[ERROR: substage crashed: {e}]", "type": "error"})
+        with sess['lock']:
+            if sub_id not in sess['completed']:
+                sess['completed'].append(sub_id)
+        push(sid, "completed", {"substage": sub_id, "findings": [], "finding_count": 0, "rc": -1})
+        _advance_chain(sid, sub_id)
+
+
+def _execute_substage(sid, sub_id):
     sess = sessions.get(sid)
     sub = find_sub(sub_id)
     if not sess or not sub:
@@ -1690,7 +1716,7 @@ def execute_substage(sid, sub_id):
     if sub_id == 'recon_ports':
         port_matches = re.findall(r'(\d+)/tcp\s+open', output)
         if port_matches:
-            sess['ports_found'] = ','.join(port_matches[:35])
+            sess['ports_found'] = ','.join(list(dict.fromkeys(port_matches))[:35])
         for svc_key in VERSION_DB:
             for line in output.splitlines():
                 if svc_key in line.lower() and 'open' in line.lower():
@@ -1832,6 +1858,8 @@ def skip(sid):
     if not sub_id or not find_sub(sub_id):
         return jsonify({"error":"unknown substage"}), 400
     with sess['lock']:
+        if sub_id in sess['completed']:
+            return jsonify({"ok": True, "note": "already completed"})
         if sub_id not in sess['skipped']:
             sess['skipped'].append(sub_id)
         if sub_id in sess['approved']:
@@ -1868,6 +1896,7 @@ def status(sid):
         "completed": sess['completed'], "approved": sess['approved'],
         "skipped": sess['skipped'],
         "finding_counts": {k:len(v) for k,v in sess['findings'].items()},
+        "findings": sess['findings'],
         "ports_found": sess.get('ports_found',''),
     })
 

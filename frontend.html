@@ -1510,30 +1510,42 @@ async function startSession(e) {
   document.getElementById('btn-start').disabled = false;
 }
 
-// Advance to the next substage/stage after a sequential-stage substage finishes.
+// Advance a sequential stage after one of its substages finishes.
+// Status is derived from CURRENT state, never from event order: with
+// "Run all substages" the completions arrive out of order, so blindly marking
+// the next-listed substage "awaiting" would regress already-finished substages
+// and the chain could never complete.
 function advanceSequential(stageId, finishedSubId) {
   const stage = CHAIN.find(s => s.id === stageId);
   if (!stage || stage.parallel) return;
-  const idx = stage.substages.findIndex(sub => sub.id === finishedSubId);
-  const nextSub = stage.substages[idx + 1];
-  if (nextSub) {
-    setSS(nextSub.id, 'awaiting');
-    showPane(nextSub.id);
-    clog(`→ awaiting: ${nextSub.id}`, 'meta');
+  const isFinished = s => subStatus[s.id] === 'done' || subStatus[s.id] === 'skipped';
+
+  // stage is only finished when every substage is done/skipped
+  if (stage.substages.every(isFinished)) {
+    const stageIdx = CHAIN.findIndex(s => s.id === stage.id);
+    const nextStage = CHAIN[stageIdx + 1];
+    if (nextStage) {
+      if (!nextStage.parallel) {
+        const first = nextStage.substages[0];
+        if (subStatus[first.id] === 'pending') {
+          setSS(first.id, 'awaiting');
+          clog(`→ awaiting: ${first.id}`, 'meta');
+        }
+        showPane(first.id);
+      } else {
+        showPane(nextStage.substages[0].id);
+        clog(`→ parallel stage ready: ${nextStage.id}`, 'meta');
+      }
+    }
     return;
   }
-  // current sequential stage done — move to the next stage
-  const stageIdx = CHAIN.findIndex(s => s.id === stage.id);
-  const nextStage = CHAIN[stageIdx + 1];
-  if (nextStage) {
-    if (!nextStage.parallel) {
-      setSS(nextStage.substages[0].id, 'awaiting');
-      showPane(nextStage.substages[0].id);
-      clog(`→ awaiting: ${nextStage.substages[0].id}`, 'meta');
-    } else {
-      showPane(nextStage.substages[0].id);
-      clog(`→ parallel stage ready: ${nextStage.id}`, 'meta');
-    }
+
+  // stage still in flight: surface the first substage that needs operator action
+  const nextOpen = stage.substages.find(s => !isFinished(s));
+  if (nextOpen && subStatus[nextOpen.id] === 'pending') {
+    setSS(nextOpen.id, 'awaiting');
+    showPane(nextOpen.id);
+    clog(`→ awaiting: ${nextOpen.id}`, 'meta');
   }
 }
 
@@ -1552,6 +1564,56 @@ function maybeComplete() {
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
+// Progress is always derived from subStatus — never accumulated — so duplicate
+// or replayed events can't skew the bar or block completion.
+function refreshProgress() {
+  doneSubs = Object.values(subStatus)
+    .filter(s => s === 'done' || s === 'skipped').length;
+  setProgress(totalSubs ? doneSubs / totalSubs * 100 : 0);
+}
+
+// Reconcile local state with the server after every (re)connect. The SSE
+// stream only replays buffered events; a long-lived session may have missed
+// completions entirely while disconnected.
+async function resyncStatus() {
+  if (!SID) return;
+  const ft = fetchTimeout(8000);
+  let d;
+  try {
+    const res = await fetch(`/api/session/${SID}/status`, { signal: ft.signal });
+    d = await res.json();
+  } catch (_) {
+    return;
+  } finally { ft.cancel(); }
+  if (!d || d.error) return;
+
+  let changed = false;
+  (d.completed || []).forEach(id => {
+    if (subStatus[id] !== 'done') { setSS(id, 'done'); changed = true; }
+  });
+  (d.skipped || []).forEach(id => {
+    if (subStatus[id] !== 'skipped') { setSS(id, 'skipped'); changed = true; }
+  });
+  if (d.findings) {
+    Object.entries(d.findings).forEach(([id, fl]) => {
+      if (!Array.isArray(fl) || !fl.length) return;
+      allFindings[id] = fl;
+      if (document.getElementById(`fl-${id}`)) renderFindings(id, fl);
+      updateFCBadge(id, fl);
+    });
+    updateStats();
+  }
+  if (changed) {
+    refreshProgress();
+    updateStageProg();
+    const stage = CHAIN.find(s => !s.parallel &&
+      s.substages.some(sub => subStatus[sub.id] === 'running' || subStatus[sub.id] === 'awaiting'));
+    clog('status resynced from server', 'meta');
+    if (stage) clog(`sequential stage in flight: ${stage.id}`, 'meta');
+  }
+  maybeComplete();
+}
+
 function connectSSE() {
   if (ES) { ES.close(); ES = null; }
   const es = new EventSource(`/api/session/${SID}/stream`);
@@ -1575,8 +1637,7 @@ function connectSSE() {
   es.addEventListener('completed', e => {
     const d = JSON.parse(e.data);
     setSS(d.substage, 'done');
-    doneSubs = Math.min(doneSubs + 1, totalSubs);
-    setProgress(doneSubs / totalSubs * 100);
+    refreshProgress();
     updateStageProg();
 
     const rc = document.getElementById(`rc-${d.substage}`);
@@ -1600,8 +1661,7 @@ function connectSSE() {
   es.addEventListener('skipped', e => {
     const d = JSON.parse(e.data);
     setSS(d.substage, 'skipped');
-    doneSubs = Math.min(doneSubs + 1, totalSubs);
-    setProgress(doneSubs / totalSubs * 100);
+    refreshProgress();
     updateStageProg();
     clog(`⇥ skipped: ${d.substage}`, 'meta');
 
@@ -1641,6 +1701,8 @@ function connectSSE() {
     try { es.close(); } catch (_) {}   // stop native auto-reconnect → single controlled stream
     setTimeout(connectSSE, 3000);
   };
+
+  resyncStatus();
 }
 
 // ── Approve / Skip ────────────────────────────────────────────────────────────
@@ -1736,6 +1798,12 @@ function reqErr(err, verb) {
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
 function setSS(id, status) {
+  // Never regress a substage: out-of-order "completed" events (run-all) or a
+  // reconnect must not turn done/skipped/running back into pending/awaiting.
+  const cur = subStatus[id];
+  if ((cur === 'done' || cur === 'skipped' || cur === 'running') &&
+      (status === 'pending' || status === 'awaiting')) return;
+  if (cur === 'awaiting' && status === 'pending') return;
   subStatus[id] = status;
   const ni = document.getElementById(`ni-${id}`);
   if (ni) ni.className = `sub-item ${status}`;
