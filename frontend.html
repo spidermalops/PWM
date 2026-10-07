@@ -1106,6 +1106,30 @@ body {
   align-items: center;
   gap: 4px;
 }
+.triage-chip {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  border: 1px solid;
+}
+.triage-chip.t-confirmed { color: #3fb950; border-color: rgba(63,185,80,.4); background: rgba(63,185,80,.1); }
+.triage-chip.t-tool     { color: #58a6ff; border-color: rgba(88,166,255,.4); background: rgba(88,166,255,.1); }
+.triage-chip.t-review   { color: #e3b341; border-color: rgba(227,179,65,.4); background: rgba(227,179,65,.1); }
+.triage-chip.t-info     { color: #8b949e; border-color: rgba(139,148,158,.4); background: rgba(139,148,158,.1); }
+.mr-warn { color: #e3b341; font-size: 9px; font-family: var(--mono); }
+.triage-ov {
+  margin-left: 6px;
+  font-size: 9px;
+  font-family: var(--mono);
+  background: #161b22;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 1px 3px;
+}
+.mono { font-family: var(--mono); }
 .modal-empty {
   padding: 40px 20px;
   text-align: center;
@@ -1296,6 +1320,11 @@ const ZDAY_TYPES = new Set([
   'protocol_mismatch','http_anomaly','signature_match','protocol_vuln',
   'auth_probe','nse_deep'
 ]);
+
+// Defense-in-depth: never show negated-result findings ("NOT VULNERABLE"
+// style) in the stats popups — mirrors _NEGATED_RESULT in app.py.
+const NEG_FINDING = /\bnot\b[^.!?\n;]{0,40}\b(?:vulnerable|exploitable)\b|\b(?:isn't|aren't|wasn't|don't|doesn't|didn't|can't)\b[^.!?\n;]{0,40}\bvulnerable\b|\bnon[-\s]?vulnerable\b|\bnever\s+vulnerable\b/i;
+const isNegFinding = f => NEG_FINDING.test(String(f.detail || f.line || f.cve || f.title || ''));
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function boot() {
@@ -1876,7 +1905,7 @@ function updateFCBadge(id, findings) {
 }
 
 function updateStats() {
-  const all = Object.values(allFindings).flat();
+  const all = Object.values(allFindings).flat().filter(f => !isNegFinding(f));
   const sc = s => all.filter(f => f.severity === s).length;
   document.getElementById('sc-c').textContent = sc('critical');
   document.getElementById('sc-h').textContent = sc('high');
@@ -1996,7 +2025,7 @@ const SEV_COLORS = {
 
 function openModal(sev) {
   modalCurrentSev = sev;
-  const all = Object.values(allFindings).flat();
+  const all = Object.values(allFindings).flat().filter(f => !isNegFinding(f));
 
   let filtered, title;
   if (sev === 'zday') {
@@ -2056,13 +2085,13 @@ function renderModalRows(findings) {
   }
   body.innerHTML = '';
 
-  // Build a lookup: finding object → substage label
+  // Build a lookup: finding object → substage label + id + index (for triage override)
   const findingSubLabel = new Map();
   for (const [subId, flist] of Object.entries(allFindings)) {
     const stage = CHAIN.find(s => s.substages.some(sub => sub.id === subId));
     const sub   = stage?.substages.find(sub => sub.id === subId);
     const label = sub ? sub.label : subId;
-    flist.forEach(f => findingSubLabel.set(f, label));
+    flist.forEach((f, i) => findingSubLabel.set(f, { label, subId, index: i }));
   }
 
   findings.forEach(f => {
@@ -2073,7 +2102,26 @@ function renderModalRows(findings) {
     const ftype  = (f.type || '').replace(/_/g, ' ');
     const path   = f.path || '—';
     const cmd    = f.command || '—';
-    const subLbl = findingSubLabel.get(f) || '—';
+    const subInfo= findingSubLabel.get(f) || { label: '—', subId: '', index: -1 };
+    const subLbl = subInfo.label;
+
+    const cvss   = f.cvss || {};
+    const cvssVal = cvss.base_score != null && cvss.base_score ? cvss.base_score + ' / ' + (cvss.severity_band || '—') : 'not scored';
+    const cvssLine = (cvss.base_score ? (cvss.vector ? ` <span class="mono" style="font-size:9px;opacity:.7">${esc(cvss.vector)}</span>` : '') : '')
+      + (cvss.band_mismatch ? ' <span class="mr-warn">⚠ band mismatch</span>' : '');
+    const triage = f.triage || {};
+    const triageCls = (triage.verdict === 'confirmed' ? 't-confirmed'
+      : triage.verdict === 'tool-confirmed' ? 't-tool'
+      : triage.verdict === 'needs_review' ? 't-review' : 't-info');
+    const prov = triage.provenance === 'analyst' ? ' (override)' : '';
+    const triageVal = esc((triage.verdict || 'needs_review').replace(/-/g,' ')) + prov;
+
+    const ev = f.evidence && typeof f.evidence === 'object' ? f.evidence : {};
+    const evFiles = [...(ev.screenshots || []), ...(ev.pcap ? [ev.pcap] : [])]
+      .map(x => esc(x.replace(/^.*\//, '')));
+    const evLine = evFiles.length
+      ? `<div class="mr2-row"><span class="mr2-lbl">Evidence</span><span class="mr2-val mono" style="font-size:9.5px;color:var(--amber, #d99000)">${evFiles.join(', ')}</span></div>`
+      : '';
 
     // inline remediation hint
     const remMap = {
@@ -2111,6 +2159,15 @@ function renderModalRows(findings) {
       </div>
       <div class="mr2-detail">${esc(detail)}</div>
       <div class="mr2-meta">
+        <div class="mr2-row"><span class="mr2-lbl">CVSS v3.1</span><span class="mr2-val">${esc(cvssVal)}${cvssLine}</span></div>
+        <div class="mr2-row"><span class="mr2-lbl">Triage</span><span class="mr2-val"><span class="triage-chip ${triageCls}">${triageVal}</span>${subInfo.subId ? ` <select class="triage-ov" data-sub="${esc(subInfo.subId)}" data-idx="${subInfo.index}" onchange="triageOverride(this)">
+            <option value="" disabled selected>override…</option>
+            <option value="confirmed">confirmed</option>
+            <option value="tool-confirmed">tool-confirmed</option>
+            <option value="needs_review">needs_review</option>
+            <option value="info">info (dismiss)</option>
+          </select>` : ''}</span></div>
+        ${evLine}
         <div class="mr2-row"><span class="mr2-lbl">Path</span><span class="mr2-val" style="font-family:var(--mono);font-size:10px;color:var(--acc)">${esc(path)}</span></div>
         <div class="mr2-row"><span class="mr2-lbl">Command</span><span class="mr2-val" style="font-family:var(--mono);font-size:9.5px;color:var(--grn)">${esc(cmd)}</span></div>
         <div class="mr2-row"><span class="mr2-lbl">Remediation</span><span class="mr2-val">${esc(rem)}</span></div>
@@ -2125,6 +2182,28 @@ function copyModalFindings() {
     `[${(f.severity||'info').toUpperCase()}] ${(f.type||'').replace(/_/g,' ')} — ${f.detail||f.line||f.cve||''}`
   ).join('\n');
   navigator.clipboard.writeText(rows).then(() => toast('Findings copied to clipboard'));
+}
+
+// Manual false-positive triage override → POST /api/session/<sid>/triage
+async function triageOverride(sel) {
+  const verdict = sel.value;
+  if (!verdict || !SID) return;
+  try {
+    const res = await fetch(`/api/session/${SID}/triage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ substage_id: sel.dataset.sub, index: parseInt(sel.dataset.idx, 10), verdict, note: '' })
+    });
+    if (!res.ok) { toast('Triage override failed'); sel.value = ''; return; }
+    sel.value = '';
+    toast(`Verdict overridden → ${verdict}`);
+    await resyncStatus();
+    const overlay = document.getElementById('modal-overlay');
+    if (overlay && overlay.classList.contains('open') && modalCurrentSev) openModal(modalCurrentSev);
+  } catch (e) {
+    toast('Triage override error');
+    sel.value = '';
+  }
 }
 
 // Keyboard: Escape closes modal

